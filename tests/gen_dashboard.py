@@ -28,6 +28,8 @@ overview.add(d.StatCard("Dungeons cleared (30d)", rpc="get_dungeons_cleared",
                         id="stat_dungeons_cleared", refresh_seconds=300))
 overview.add(d.StatCard("Duels fought (30d)", rpc="get_duels_fought",
                         id="stat_duels_fought", refresh_seconds=300))
+overview.add(d.StatCard("Caches opened (30d)", rpc="get_caches_opened",
+                        id="stat_caches_opened", refresh_seconds=300))
 overview.add(d.Chart("Commands — 7 days", rpc="get_commands_chart", id="chart_commands_7d",
                      chart_type="line", width="full", refresh_seconds=300))
 

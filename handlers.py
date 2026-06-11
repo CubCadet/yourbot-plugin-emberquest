@@ -47,6 +47,10 @@ TRADE_ACCEPT_PREFIX = "v1:trade:accept:"
 TRADE_DECLINE_PREFIX = "v1:trade:decline:"
 TRADE_CANCEL_PREFIX = "v1:trade:cancel:"
 ARENA_JOIN_PREFIX = "v1:arena:join:"
+QUEST_CLAIM_PREFIX = "v1:quest:claim:"
+REKINDLE_CONFIRM_PREFIX = "v1:prestige:confirm:"
+LOOT_AGAIN_PREFIX = "v1:loot:again:"
+PET_SET_PREFIX = "v1:pet:set:"
 
 KV_MULTIPLIER = "economy_multiplier"
 KV_CHANNEL = "allowed_channel_id"
@@ -56,6 +60,7 @@ COMMAND_NAMES = [
     "shop", "buy", "sell", "daily", "leaderboard", "coinflip",
     "dungeon", "craft", "enchant",
     "duel", "trade", "guild", "arena",
+    "equip", "pet", "open", "quests", "rekindle",
 ]
 
 _rng = random.Random()
@@ -86,7 +91,9 @@ _SCHEMA = (
     "  last_dungeon_at   BIGINT NOT NULL DEFAULT 0,"
     "  sword_enchant     INT NOT NULL DEFAULT 0,"
     "  armor_enchant     INT NOT NULL DEFAULT 0,"
-    "  last_duel_at      BIGINT NOT NULL DEFAULT 0)",
+    "  last_duel_at      BIGINT NOT NULL DEFAULT 0,"
+    "  pet               TEXT NOT NULL DEFAULT '',"
+    "  rekindles         INT NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS inventory ("
     "  user_id TEXT NOT NULL,"
     "  item_id TEXT NOT NULL,"
@@ -119,7 +126,8 @@ _SCHEMA = (
     "  bet             BIGINT NOT NULL DEFAULT 0,"
     "  status          TEXT NOT NULL DEFAULT 'open',"
     "  channel_id      TEXT NOT NULL DEFAULT '',"
-    "  created_at      BIGINT NOT NULL)",
+    "  created_at      BIGINT NOT NULL,"
+    "  epoch           INT NOT NULL DEFAULT 0)",
     # One live challenge per challenger — the predicate includes 'resolving' so
     # a second challenge can never slip in mid-settlement (which would make the
     # resolving→open REOPEN collide with this very index).
@@ -135,7 +143,8 @@ _SCHEMA = (
     "  price       BIGINT NOT NULL DEFAULT 0,"
     "  status      TEXT NOT NULL DEFAULT 'open',"
     "  channel_id  TEXT NOT NULL DEFAULT '',"
-    "  created_at  BIGINT NOT NULL)",
+    "  created_at  BIGINT NOT NULL,"
+    "  epoch       INT NOT NULL DEFAULT 0)",
     "CREATE UNIQUE INDEX IF NOT EXISTS trades_one_live_per_seller "
     "ON trades (seller_id) WHERE status IN ('open', 'resolving')",
     "CREATE TABLE IF NOT EXISTS guilds ("
@@ -163,6 +172,15 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS arena_days ("
     "  day         TEXT PRIMARY KEY,"
     "  resolved_at BIGINT NOT NULL DEFAULT 0)",
+    # Daily quest progress. The quest LIST is derived deterministically from
+    # (day, user_id) — only counters and claim flags need storage.
+    "CREATE TABLE IF NOT EXISTS quest_progress ("
+    "  user_id   TEXT NOT NULL,"
+    "  day       TEXT NOT NULL,"
+    "  quest_idx INT NOT NULL,"
+    "  progress  INT NOT NULL DEFAULT 0,"
+    "  claimed   INT NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (user_id, day, quest_idx))",
 )
 
 # Upgrades for servers that installed the Phase-1 schema. New installs get the
@@ -172,6 +190,10 @@ _MIGRATIONS = (
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS sword_enchant INT NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS armor_enchant INT NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_duel_at BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS pet TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS rekindles INT NOT NULL DEFAULT 0",
+    "ALTER TABLE duels ADD COLUMN IF NOT EXISTS epoch INT NOT NULL DEFAULT 0",
+    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS epoch INT NOT NULL DEFAULT 0",
 )
 
 
@@ -223,13 +245,16 @@ _CLAIM_COOLDOWN = {
 
 # Encounter settlement: xp/coins relative; level/max_hp ratchet up only
 # (a slower concurrent writer must never downgrade them); coins clamp at 0.
+# The trailing `rekindles = %s` is the EPOCH GUARD: a Rekindling is the one
+# legitimate downgrade, so any settle computed from a pre-burn read must land
+# in the void rather than resurrect the old character.
 _ENCOUNTER_UPDATE = (
     "UPDATE players SET username = %s, xp = xp + %s, "
     "level = CASE WHEN level < %s THEN %s ELSE level END, "
     "max_hp = CASE WHEN max_hp < %s THEN %s ELSE max_hp END, "
     "hp = %s, "
     "coins = CASE WHEN coins + %s < 0 THEN 0 ELSE coins + %s END, "
-    "last_action_at = %s WHERE user_id = %s"
+    "last_action_at = %s WHERE user_id = %s AND rekindles = %s"
 )
 
 _HEAL_WITH_POTION = ("UPDATE players SET username = %s, hp = %s, last_action_at = %s "
@@ -246,6 +271,22 @@ _EQUIP_CAS = {
     "armor": ("UPDATE players SET username = %s, armor = %s, armor_enchant = 0 "
               "WHERE user_id = %s AND armor = %s"),
 }
+
+# /equip's variant additionally proves ownership IN the same statement — a
+# concurrent sell/trade escrow can't slip between the check and the swap.
+_EQUIP_OWNED_CAS = {
+    "sword": ("UPDATE players SET username = %s, sword = %s, sword_enchant = 0 "
+              "WHERE user_id = %s AND sword = %s AND EXISTS "
+              "(SELECT 1 FROM inventory WHERE user_id = %s AND item_id = %s AND qty > 0)"),
+    "armor": ("UPDATE players SET username = %s, armor = %s, armor_enchant = 0 "
+              "WHERE user_id = %s AND armor = %s AND EXISTS "
+              "(SELECT 1 FROM inventory WHERE user_id = %s AND item_id = %s AND qty > 0)"),
+}
+
+# Same idea for the leash: setting an active pet proves ownership atomically.
+_SET_PET_OWNED = ("UPDATE players SET pet = %s WHERE user_id = %s AND EXISTS "
+                  "(SELECT 1 FROM inventory WHERE user_id = %s AND item_id = %s "
+                  "AND qty > 0)")
 
 _CREDIT_COINS = "UPDATE players SET username = %s, coins = coins + %s WHERE user_id = %s"
 
@@ -294,10 +335,13 @@ _FINISH_DUNGEON = "UPDATE dungeons SET status = 'resolved' WHERE id = %s"
 
 # --- Duel statements (Phase 3) ---------------------------------------------------
 
-# The duels_one_open_per_challenger index rejects a second concurrent open.
+# The duels_one_live_per_challenger index rejects a second concurrent open;
+# the epoch WHERE refuses a challenge whose escrow was debited from a
+# character that Rekindled mid-handler (the stake burns via the epoch refund).
 _OPEN_DUEL = ("INSERT INTO duels (id, challenger_id, target_id, challenger_name, "
-              "target_name, bet, status, channel_id, created_at) "
-              "VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s)")
+              "target_name, bet, status, channel_id, created_at, epoch) "
+              "SELECT %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s "
+              "WHERE (SELECT rekindles FROM players WHERE user_id = %s) = %s")
 # Status transitions are all CAS — every escrow refund happens exactly once.
 _DUEL_ACCEPT_CAS = "UPDATE duels SET status = 'resolving' WHERE id = %s AND status = 'open'"
 _DUEL_REOPEN = "UPDATE duels SET status = 'open' WHERE id = %s AND status = 'resolving'"
@@ -312,21 +356,35 @@ _PRUNE_DUELS = ("DELETE FROM duels WHERE status NOT IN ('open', 'resolving') "
                 "AND created_at < %s")
 
 # Duel/arena settlements ratchet level and max_hp but never touch HP — honor
-# bouts leave no wounds (and so no level-up heal either).
+# bouts leave no wounds (and so no level-up heal either). Epoch-guarded like
+# every settle: a Rekindled character never inherits stale spoils.
 _DUEL_SETTLE = ("UPDATE players SET xp = xp + %s, "
                 "level = CASE WHEN level < %s THEN %s ELSE level END, "
                 "max_hp = CASE WHEN max_hp < %s THEN %s ELSE max_hp END, "
-                "coins = coins + %s, last_duel_at = %s WHERE user_id = %s")
+                "coins = coins + %s, last_duel_at = %s "
+                "WHERE user_id = %s AND rekindles = %s")
 _AWARD_XP = ("UPDATE players SET xp = xp + %s, "
              "level = CASE WHEN level < %s THEN %s ELSE level END, "
              "max_hp = CASE WHEN max_hp < %s THEN %s ELSE max_hp END "
-             "WHERE user_id = %s")
+             "WHERE user_id = %s AND rekindles = %s")
+
+# Epoch-guarded credit/grant for any flow whose debit-or-read happened earlier
+# in the same handler: if a Rekindling landed in between, the value burns.
+_CREDIT_COINS_EPOCH = ("UPDATE players SET username = %s, coins = coins + %s "
+                       "WHERE user_id = %s AND rekindles = %s")
+_ADD_ITEM_EPOCH = (
+    "INSERT INTO inventory (user_id, item_id, qty) "
+    "SELECT %s, %s, %s "
+    "WHERE (SELECT rekindles FROM players WHERE user_id = %s) = %s "
+    "ON CONFLICT (user_id, item_id) DO UPDATE SET qty = inventory.qty + %s"
+)
 
 # --- Trade statements (Phase 3) ----------------------------------------------------
 
 _OPEN_TRADE = ("INSERT INTO trades (id, seller_id, buyer_id, seller_name, item_id, qty, "
-               "price, status, channel_id, created_at) "
-               "VALUES (%s, %s, %s, %s, %s, %s, %s, 'open', %s, %s)")
+               "price, status, channel_id, created_at, epoch) "
+               "SELECT %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s "
+               "WHERE (SELECT rekindles FROM players WHERE user_id = %s) = %s")
 _TRADE_ACCEPT_CAS = "UPDATE trades SET status = 'resolving' WHERE id = %s AND status = 'open'"
 _TRADE_REOPEN = "UPDATE trades SET status = 'open' WHERE id = %s AND status = 'resolving'"
 _TRADE_DECLINE_CAS = "UPDATE trades SET status = 'declined' WHERE id = %s AND status = 'open'"
@@ -370,16 +428,60 @@ _ARENA_CLAIM_DAY = ("INSERT INTO arena_days (day, resolved_at) VALUES (%s, %s) "
 _PRUNE_ARENA_ENTRIES = "DELETE FROM arena_entries WHERE day < %s"
 _PRUNE_ARENA_DAYS = "DELETE FROM arena_days WHERE day < %s"
 
+# --- Quest statements (Phase 4) -----------------------------------------------------------
+
+_QUEST_PROGRESS_UPSERT = (
+    "INSERT INTO quest_progress (user_id, day, quest_idx, progress, claimed) "
+    "VALUES (%s, %s, %s, %s, 0) "
+    "ON CONFLICT (user_id, day, quest_idx) DO UPDATE "
+    "SET progress = quest_progress.progress + %s"
+)
+# The claim rides on this rowcount: complete, unclaimed, exactly once.
+_QUEST_CLAIM_CAS = (
+    "UPDATE quest_progress SET claimed = 1 "
+    "WHERE user_id = %s AND day = %s AND quest_idx = %s "
+    "AND claimed = 0 AND progress >= %s"
+)
+_PRUNE_QUESTS = "DELETE FROM quest_progress WHERE day < %s"
+
+# --- Pet & Rekindling statements (Phase 4) ----------------------------------------------------
+
+# CAS on the current companion — only clears if it's still the one leaving.
+_CLEAR_PET_CAS = "UPDATE players SET pet = '' WHERE user_id = %s AND pet = %s"
+# A pet fresh from a cache pads an empty leash automatically.
+_ADOPT_IF_PETLESS = "UPDATE players SET pet = %s WHERE user_id = %s AND pet = ''"
+
+# The whole prestige reset is ONE guarded statement: the level check and the
+# rekindle increment land together, so a stale or double-pressed confirm
+# button can never fire twice. last_daily_at survives (no bonus daily).
+_REKINDLE_RESET = (
+    "UPDATE players SET level = 1, xp = 0, hp = 100, max_hp = 100, coins = 0, "
+    "sword = 'fists', armor = 'cloth', sword_enchant = 0, armor_enchant = 0, "
+    "last_hunt_at = 0, last_adventure_at = 0, last_dungeon_at = 0, "
+    "last_duel_at = 0, rekindles = rekindles + 1, last_action_at = %s "
+    "WHERE user_id = %s AND level >= %s"
+)
+_WIPE_INVENTORY_EXCEPT = "DELETE FROM inventory WHERE user_id = %s AND item_id != %s"
+
 _DUNGEON_MEMBER_UPDATE = (
     "UPDATE players SET xp = xp + %s, "
     "level = CASE WHEN level < %s THEN %s ELSE level END, "
     "max_hp = CASE WHEN max_hp < %s THEN %s ELSE max_hp END, "
     "hp = %s, coins = coins + %s, "
-    "last_dungeon_at = %s, last_action_at = %s WHERE user_id = %s"
+    "last_dungeon_at = %s, last_action_at = %s "
+    "WHERE user_id = %s AND rekindles = %s"
 )
 
 _COINS_SUB_GUARDED = ("UPDATE players SET username = %s, coins = coins - %s "
                       "WHERE user_id = %s AND coins >= %s")
+# Escrow debits are epoch-stamped so a debit and its eventual refund share one
+# epoch by construction — a handler straddling a Rekindling can neither consume
+# post-burn assets nor strand its refund.
+_COINS_SUB_GUARDED_EPOCH = ("UPDATE players SET username = %s, coins = coins - %s "
+                            "WHERE user_id = %s AND coins >= %s AND rekindles = %s")
+_INVENTORY_TAKE_N_EPOCH = ("UPDATE inventory SET qty = qty - %s "
+                           "WHERE user_id = %s AND item_id = %s AND qty >= %s "
+                           "AND (SELECT rekindles FROM players WHERE user_id = %s) = %s")
 
 # Guarded take: rowcount 0 means the item wasn't there — qty can never go negative.
 _INVENTORY_TAKE = ("UPDATE inventory SET qty = qty - 1 "
@@ -478,6 +580,23 @@ def _apply_regen(player: dict, now: int) -> dict:
     return player
 
 
+def _boosts_for(player, now) -> dict:
+    """Passive multipliers from companion + Rekindlings + active season."""
+    return game.player_boosts(player.get("pet") or "",
+                              int(player.get("rekindles") or 0),
+                              game.current_season(now))
+
+
+def _quest_event(ctx, user_id, event_key, now, amount=1):
+    """Tick today's quest counters for an action. Called via _quietly at every
+    hook site — quest bookkeeping must never break the action it rode on."""
+    day = game.arena_day(now)
+    for idx, quest in enumerate(game.daily_quests(str(user_id), day)):
+        if quest["key"] == event_key:
+            ctx.sql.execute(_QUEST_PROGRESS_UPSERT,
+                            [str(user_id), day, idx, amount, amount])
+
+
 def _begin(ctx, event, command, *, needs_player=True):
     """Common command preamble: metrics, channel gate, player lookup.
 
@@ -557,12 +676,22 @@ def _gear_label(player, slot) -> str:
     return f"{item['emoji']} {item['name']}{suffix} (+{_player_defense(player)} def)"
 
 
-def _add_item(ctx, user_id, item_id, amount=1):
-    ctx.sql.execute(
-        "INSERT INTO inventory (user_id, item_id, qty) VALUES (%s, %s, %s) "
-        "ON CONFLICT (user_id, item_id) DO UPDATE SET qty = inventory.qty + %s",
-        [user_id, item_id, amount, amount],
-    )
+def _epoch(player) -> int:
+    return int(player.get("rekindles") or 0)
+
+
+def _add_item(ctx, user_id, item_id, amount=1, epoch=None):
+    """Grant items. With `epoch`, the grant only lands if the character hasn't
+    Rekindled since that epoch was read — stale grants burn (rowcount 0)."""
+    if epoch is None:
+        ctx.sql.execute(
+            "INSERT INTO inventory (user_id, item_id, qty) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id, item_id) DO UPDATE SET qty = inventory.qty + %s",
+            [user_id, item_id, amount, amount],
+        )
+        return True
+    return ctx.sql.execute(_ADD_ITEM_EPOCH,
+                           [user_id, item_id, amount, user_id, epoch, amount]) > 0
 
 
 def _take_item(ctx, user_id, item_id) -> bool:
@@ -603,6 +732,7 @@ def cmd_start(ctx, event):
         "• **/dungeon** — rally 2–4 heroes against a miniboss (level 3+)\n"
         "• **/craft** gear and tonics from dungeon materials, **/enchant** your gear\n"
         "• **/duel** rivals, **/trade** with friends, **/guild** up, fight the daily **/arena**\n"
+        "• **/quests** each day, **/open** Ember Caches, raise a **/pet** — and one day, **/rekindle**\n"
         "• **/heal** with healing tonics when the wounds add up\n"
         "• **/shop**, **/buy** and **/sell** to gear up\n"
         "• **/daily** for your stipend, **/leaderboard** to see the legends\n"
@@ -628,9 +758,14 @@ def cmd_profile(ctx, event):
         else:
             _try_respond(ctx, "That adventurer hasn't entered the Cinderwilds yet.")
         return
-    player = _apply_regen(player, _now())
+    now = _now()
+    player = _apply_regen(player, now)
     xp_in_level, xp_span = game.xp_progress(player["level"], player["xp"])
     name = player["username"] or f"Hero {target_id[-4:]}"
+    flames = int(player.get("rekindles") or 0)
+    title = f"{name} — Level {player['level']}"
+    if flames:
+        title += f" 🔥×{flames}"
     fields = [
         {"name": "XP", "value": f"`{game.progress_bar(xp_in_level, xp_span)}` "
                                 f"{xp_in_level}/{xp_span}", "inline": True},
@@ -639,12 +774,19 @@ def cmd_profile(ctx, event):
         {"name": "Sword", "value": _gear_label(player, "sword"), "inline": True},
         {"name": "Armor", "value": _gear_label(player, "armor"), "inline": True},
     ]
+    pet_id = player.get("pet") or ""
+    if pet_id in game.PET_PERKS:
+        pet = game.ITEMS[pet_id]
+        fields.append({"name": "Companion",
+                       "value": f"{pet['emoji']} {pet['name']} — "
+                                f"{game.PET_PERKS[pet_id]['label']}", "inline": True})
     guild = _my_guild(ctx, target_id)
     if guild:
         fields.append({"name": "Guild", "value": f"🏳️ {guild['name']}", "inline": True})
-    ctx.interaction.respond(embeds=[_embed(
-        f"{name} — Level {player['level']}", fields=fields,
-    )])
+    season = game.current_season(now)
+    footer = (f"{season['emoji']} {_cap(season['name'])} burns — +25% Embers & XP!"
+              if season else None)
+    ctx.interaction.respond(embeds=[_embed(title, fields=fields, footer=footer)])
 
 
 # --- /hunt + Hunt again / Heal buttons ----------------------------------------
@@ -663,11 +805,14 @@ def _do_hunt(ctx, event, state):
     result = game.resolve_hunt(
         player["level"], _player_atk(player), _player_defense(player),
         player["hp"], player["coins"], _rng, state["multiplier"],
+        _boosts_for(player, now),
     )
     extra_fields = None
     if result.get("drop"):
-        _add_item(ctx, player["user_id"], result["drop"])
+        _add_item(ctx, player["user_id"], result["drop"], epoch=_epoch(player))
         extra_fields = [_loot_field([result["drop"]])]
+    if result["win"]:
+        _quietly(_quest_event, ctx, player["user_id"], "hunt_win", now)
     _finish_encounter(ctx, event, player, result, now, extra_fields)
 
 
@@ -685,7 +830,8 @@ def _finish_encounter(ctx, event, player, result, now, extra_fields=None):
         _ENCOUNTER_UPDATE,
         [_username(event) or player["username"], result["xp_gain"],
          new_level, new_level, new_max_hp, new_max_hp, hp_after,
-         result["coins_delta"], result["coins_delta"], anchor, player["user_id"]],
+         result["coins_delta"], result["coins_delta"], anchor, player["user_id"],
+         _epoch(player)],
     )
 
     foe = result["foe"]["name"]
@@ -700,6 +846,8 @@ def _finish_encounter(ctx, event, player, result, now, extra_fields=None):
     else:
         title = f"🏃 The {foe} drove you off!"
         description = f"No spoils this time — you took **{result['damage']}** damage."
+    if result.get("seasonal"):
+        description += "\n✨ *A creature of the season — its spoils burn half again as bright!*"
 
     fields = [_hp_field(hp_after, new_max_hp),
               {"name": game.CURRENCY, "value": f"🔥 {coins_display:,}", "inline": True}]
@@ -764,13 +912,16 @@ def cmd_adventure(ctx, event):
     result = game.resolve_adventure(
         player["level"], _player_atk(player), _player_defense(player),
         player["hp"], player["coins"], _rng, state["multiplier"],
+        _boosts_for(player, now),
     )
     loot = [i for i in (result.get("drop"), result.get("material")) if i]
     extra_fields = None
     if loot:
         for item_id in loot:
-            _add_item(ctx, player["user_id"], item_id)
+            _add_item(ctx, player["user_id"], item_id, epoch=_epoch(player))
         extra_fields = [_loot_field(loot)]
+    if result["win"]:
+        _quietly(_quest_event, ctx, player["user_id"], "adventure_win", now)
     _finish_encounter(ctx, event, player, result, now, extra_fields)
 
 
@@ -815,6 +966,7 @@ def _do_heal(ctx, event, state):
                           f"**{tonic['price']} {game.CURRENCY}** — hunt for more Embers first.")
         return
 
+    _quietly(_quest_event, ctx, user_id, "heal", now)
     ctx.interaction.respond(embeds=[_embed(
         "🧪 Healed", message, fields=[_hp_field(hp_after, player["max_hp"])],
     )], ephemeral=True)
@@ -866,9 +1018,14 @@ def _shop_response(ctx, page_index, user_id):
     lines = []
     for item_id in item_ids:
         item = game.ITEMS[item_id]
-        stat = (f"+{item['atk']} atk" if item["kind"] == "sword"
-                else f"+{item['defense']} def" if item["kind"] == "armor"
-                else ("full heal" if item["heal"] is None else f"heals {item['heal']} HP"))
+        if item["kind"] == "sword":
+            stat = f"+{item['atk']} atk"
+        elif item["kind"] == "armor":
+            stat = f"+{item['defense']} def"
+        elif item["kind"] == "lootbox":
+            stat = "mystery contents — crack it with /open"
+        else:
+            stat = "full heal" if item["heal"] is None else f"heals {item['heal']} HP"
         lines.append(f"{item['emoji']} **{item['name']}** — {item['price']:,} {game.CURRENCY} · *{stat}*")
     buttons = [
         Button("◀ Prev", f"{SHOP_PAGE_PREFIX}{page_index - 1}:{user_id}",
@@ -943,7 +1100,7 @@ def cmd_buy(ctx, event):
         _try_respond(ctx, f"You're short on {game.CURRENCY}: **{item['name']}** costs "
                           f"**{item['price']:,}**, you carry **{player['coins']:,}**.")
         return
-    _add_item(ctx, player["user_id"], item_id)
+    _add_item(ctx, player["user_id"], item_id, epoch=_epoch(player))
 
     # Auto-equip only a genuine upgrade: compare against the EFFECTIVE stat
     # (gear + enchant) so a +3 blade isn't overwritten by a worse base item.
@@ -983,11 +1140,12 @@ def cmd_sell(ctx, event):
         return
     price = game.sell_price(item_id)
     name = _username(event) or player["username"]
-    ctx.sql.execute(_CREDIT_COINS, [name, price, player["user_id"]])
+    ctx.sql.execute(_CREDIT_COINS_EPOCH, [name, price, player["user_id"], _epoch(player)])
 
     unequip_note = ""
+    # The unstrap CAS runs whenever the last copy leaves, WITHOUT consulting
+    # the stale row: a concurrent /equip can't keep a sold item's stats.
     if (item["kind"] in ("sword", "armor")
-            and player[_equipped_column(item["kind"])] == item_id
             and _item_qty(ctx, player["user_id"], item_id) <= 0):
         gear_column = _equipped_column(item["kind"])
         owned = ctx.sql.query(
@@ -995,11 +1153,14 @@ def cmd_sell(ctx, event):
             [player["user_id"]], limit=100,
         )
         fallback = game.best_gear(item["kind"], [row["item_id"] for row in owned])
-        # CAS on the sold item: if the slot already changed, leave it alone.
         if ctx.sql.execute(_EQUIP_CAS[gear_column],
                            [name, fallback, player["user_id"], item_id]):
             unequip_note = (f"\nThat was your equipped {item['kind']} — you fall back to "
                             f"your {game.ITEMS[fallback]['name']}.")
+    elif (item["kind"] == "pet"
+            and _item_qty(ctx, player["user_id"], item_id) <= 0):
+        if ctx.sql.execute(_CLEAR_PET_CAS, [player["user_id"], item_id]):
+            unequip_note = f"\nYour {item['name']} pads off to its new keeper — the leash hangs empty."
     fresh = _get_player(ctx, player["user_id"]) or player
     ctx.interaction.respond(embeds=[_embed(
         f"{item['emoji']} Sold: {item['name']}",
@@ -1021,10 +1182,13 @@ def cmd_daily(ctx, event):
     if not _claim_cooldown(ctx, player, "daily", "last_daily_at", game.DAILY_COOLDOWN, now):
         return
     reward = game.daily_reward(player["level"], state["multiplier"])
+    boosts = _boosts_for(player, now)
+    reward["coins"] = max(1, round(reward["coins"] * boosts["coins"]))
     potion = game.ITEMS[reward["item"]]
-    ctx.sql.execute(_CREDIT_COINS,
-                    [_username(event) or player["username"], reward["coins"], player["user_id"]])
-    _add_item(ctx, player["user_id"], reward["item"])
+    ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                    [_username(event) or player["username"], reward["coins"],
+                     player["user_id"], _epoch(player)])
+    _add_item(ctx, player["user_id"], reward["item"], epoch=_epoch(player))
     ctx.interaction.respond(embeds=[_embed(
         "🌅 Daily stipend claimed",
         f"**+{reward['coins']:,} {game.CURRENCY}** and a {potion['emoji']} **{potion['name']}** "
@@ -1066,13 +1230,13 @@ def cmd_leaderboard(ctx, event):
     else:
         if metric == "coins":
             rows = ctx.sql.query(
-                "SELECT user_id, username, level, coins FROM players "
+                "SELECT user_id, username, level, coins, rekindles FROM players "
                 "ORDER BY coins DESC LIMIT 10",
                 limit=10,
             )
         else:
             rows = ctx.sql.query(
-                "SELECT user_id, username, level, xp, coins FROM players "
+                "SELECT user_id, username, level, xp, coins, rekindles FROM players "
                 "ORDER BY level DESC, xp DESC LIMIT 10",
                 limit=10,
             )
@@ -1082,7 +1246,8 @@ def cmd_leaderboard(ctx, event):
         for i, row in enumerate(rows):
             rank = medals[i] if i < len(medals) else f"`#{i + 1}`"
             name = row["username"] or f"Hero {str(row['user_id'])[-4:]}"
-            lines.append(f"{rank} **{name}** — Level {row['level']} · 🔥 {row['coins']:,}")
+            flames = f" 🔥×{row['rekindles']}" if int(row.get("rekindles") or 0) else ""
+            lines.append(f"{rank} **{name}**{flames} — Level {row['level']} · 🔥 {row['coins']:,}")
     ctx.interaction.respond(embeds=[_embed(
         f"🏆 Legends of the Cinderwilds — by {metric}",
         "\n".join(lines),
@@ -1113,7 +1278,8 @@ def cmd_coinflip(ctx, event):
     result = game.coinflip(bet, player["coins"], _rng)
     name = _username(event) or player["username"]
     if result["won"]:
-        ctx.sql.execute(_CREDIT_COINS, [name, result["wager"], player["user_id"]])
+        ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                        [name, result["wager"], player["user_id"], _epoch(player)])
     else:
         # Guarded debit: if a concurrent spend already drained the balance,
         # cancel the flip rather than going negative.
@@ -1122,6 +1288,7 @@ def cmd_coinflip(ctx, event):
             _try_respond(ctx, "Your Embers shifted before the flip landed — wager cancelled.")
             return
     ctx.metrics.record("coinflip_wagered", value=float(result["wager"]))
+    _quietly(_quest_event, ctx, player["user_id"], "coinflip", _now())
     fresh = _get_player(ctx, player["user_id"]) or player
     clamp_note = ""
     if result["wager"] < bet:
@@ -1469,11 +1636,13 @@ def _resolve_dungeon(ctx, lobby, now, multiplier):
         ctx.sql.execute(
             _DUNGEON_MEMBER_UPDATE,
             [outcome["xp"], new_level, new_level, new_max_hp, new_max_hp,
-             hp_after, outcome["coins"], now, anchor, outcome["user_id"]],
+             hp_after, outcome["coins"], now, anchor, outcome["user_id"],
+             _epoch(row)],
         )
+        _quietly(_quest_event, ctx, outcome["user_id"], "dungeon", now)
         loot_bits = []
         for item_id, count in outcome["drops"]:
-            _add_item(ctx, outcome["user_id"], item_id, count)
+            _add_item(ctx, outcome["user_id"], item_id, count, epoch=_epoch(row))
             item = game.ITEMS[item_id]
             loot_bits.append(f"{item['emoji']}×{count}")
         name = outcome["username"] or f"Hero {str(outcome['user_id'])[-4:]}"
@@ -1584,16 +1753,17 @@ def comp_craft(ctx, event):
     _do_craft(ctx, event, state, recipe_id)
 
 
-def _refund_craft_costs(ctx, name, user_id, taken_materials, fee):
+def _refund_craft_costs(ctx, name, user_id, taken_materials, fee, epoch):
     """Best-effort compensation: put back what was taken. Each step is wrapped
-    so one failed refund doesn't abort the rest."""
+    so one failed refund doesn't abort the rest; everything rides the epoch
+    guard so a mid-craft Rekindling burns the costs instead of refunding."""
     for material_id in taken_materials:
         try:
-            _add_item(ctx, user_id, material_id)
+            _add_item(ctx, user_id, material_id, epoch=epoch)
         except (SdkError, RuntimeError):
             pass
     try:
-        ctx.sql.execute(_CREDIT_COINS, [name, fee, user_id])
+        ctx.sql.execute(_CREDIT_COINS_EPOCH, [name, fee, user_id, epoch])
     except (SdkError, RuntimeError):
         pass
 
@@ -1625,16 +1795,16 @@ def _do_craft(ctx, event, state, recipe_id):
             if shortage:
                 break
     except (SdkError, RuntimeError):
-        _refund_craft_costs(ctx, name, user_id, taken, recipe["fee"])
+        _refund_craft_costs(ctx, name, user_id, taken, recipe["fee"], _epoch(player))
         raise  # _safe answers the user
     if shortage:
-        _refund_craft_costs(ctx, name, user_id, taken, recipe["fee"])
+        _refund_craft_costs(ctx, name, user_id, taken, recipe["fee"], _epoch(player))
         needs = " · ".join(f"{game.ITEMS[m]['emoji']} {game.ITEMS[m]['name']} ×{n}"
                            for m, n in recipe["materials"].items())
         _try_respond(ctx, f"Missing materials for **{item['name']}** — it takes {needs}.")
         return
 
-    _add_item(ctx, user_id, recipe_id)
+    _add_item(ctx, user_id, recipe_id, epoch=_epoch(player))
     equipped_note = ""
     if item["kind"] in ("sword", "armor"):
         column = _equipped_column(item["kind"])
@@ -1643,6 +1813,7 @@ def _do_craft(ctx, event, state, recipe_id):
             if ctx.sql.execute(_EQUIP_CAS[column], [name, recipe_id, user_id, player[column]]):
                 equipped_note = ("\nYou equip it straight off the anvil. "
                                  "(Any old enchantment fades.)")
+    _quietly(_quest_event, ctx, user_id, "craft", _now())
     consumed = " · ".join(f"{game.ITEMS[m]['emoji']} {game.ITEMS[m]['name']} ×{n}"
                           for m, n in recipe["materials"].items())
     ctx.interaction.respond(embeds=[_embed(
@@ -1692,10 +1863,12 @@ def cmd_enchant(ctx, event):
         while taken < cost["materials"] and _take_item(ctx, user_id, game.ENCHANT_MATERIAL):
             taken += 1
     except (SdkError, RuntimeError):
-        _refund_craft_costs(ctx, name, user_id, [game.ENCHANT_MATERIAL] * taken, cost["coins"])
+        _refund_craft_costs(ctx, name, user_id, [game.ENCHANT_MATERIAL] * taken,
+                            cost["coins"], _epoch(player))
         raise  # _safe answers the user
     if taken < cost["materials"]:
-        _refund_craft_costs(ctx, name, user_id, [game.ENCHANT_MATERIAL] * taken, cost["coins"])
+        _refund_craft_costs(ctx, name, user_id, [game.ENCHANT_MATERIAL] * taken,
+                            cost["coins"], _epoch(player))
         _try_respond(ctx, f"The ritual to **+{current + 1}** needs {shard['emoji']} "
                           f"**{shard['name']} ×{cost['materials']}** — you have too few.")
         return
@@ -1716,10 +1889,12 @@ def cmd_enchant(ctx, event):
                 footer=game.VIRTUAL_NOTE,
             )], ephemeral=True)
         else:
-            # Gear or enchant level changed mid-ritual — void it and refund.
-            for _ in range(cost["materials"]):
-                _add_item(ctx, user_id, game.ENCHANT_MATERIAL)
-            ctx.sql.execute(_CREDIT_COINS, [name, cost["coins"], user_id])
+            # Gear or enchant level changed mid-ritual — void it and refund
+            # (epoch-guarded both halves: a mid-ritual Rekindling burns it all).
+            _add_item(ctx, user_id, game.ENCHANT_MATERIAL, cost["materials"],
+                      epoch=_epoch(player))
+            ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                            [name, cost["coins"], user_id, _epoch(player)])
             _try_respond(ctx, "The ritual fizzled — your gear shifted mid-incantation. "
                               "Costs returned.")
     else:
@@ -1746,20 +1921,20 @@ def _settle_social(ctx, player_row, xp_gain, coins_delta=None, duel_time=None) -
     if duel_time is not None:
         ctx.sql.execute(_DUEL_SETTLE,
                         [xp_gain, new_level, new_level, new_max_hp, new_max_hp,
-                         coins_delta or 0, duel_time, player_row["user_id"]])
+                         coins_delta or 0, duel_time, player_row["user_id"],
+                         _epoch(player_row)])
     else:
         ctx.sql.execute(_AWARD_XP,
                         [xp_gain, new_level, new_level, new_max_hp, new_max_hp,
-                         player_row["user_id"]])
+                         player_row["user_id"], _epoch(player_row)])
     return new_level - player_row["level"]
 
 
 def _expire_duel_if_stale(ctx, duel, now) -> bool:
     if duel["status"] != "open" or now - int(duel["created_at"]) < game.DUEL_TTL:
         return duel["status"] in ("expired", "declined", "resolved")
-    if ctx.sql.execute(_DUEL_EXPIRE_CAS, [duel["id"]]) and int(duel["bet"]) > 0:
-        ctx.sql.execute(_CREDIT_COINS,
-                        [duel["challenger_name"], duel["bet"], duel["challenger_id"]])
+    if ctx.sql.execute(_DUEL_EXPIRE_CAS, [duel["id"]]):
+        _refund_duel_stake(ctx, duel)  # epoch-guarded against Rekindling
     return True
 
 
@@ -1772,9 +1947,11 @@ def _sweep_stale_duels(ctx, now):
 
 
 def _refund_duel_stake(ctx, duel):
+    # Epoch-guarded: a stake escrowed before a Rekindling burns with the rest.
     if int(duel["bet"]) > 0:
-        ctx.sql.execute(_CREDIT_COINS,
-                        [duel["challenger_name"], duel["bet"], duel["challenger_id"]])
+        ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                        [duel["challenger_name"], duel["bet"], duel["challenger_id"],
+                         int(duel.get("epoch") or 0)])
 
 
 def _reopen_or_void_duel(ctx, duel) -> bool:
@@ -1824,24 +2001,32 @@ def cmd_duel(ctx, event):
                           f"{game.fmt_duration(recovery)}.")
         return
     name = _username(event) or player["username"]
-    # Escrow the challenger's stake up front; refunded on decline/expiry.
-    if bet and not ctx.sql.execute(_COINS_SUB_GUARDED,
-                                   [name, bet, player["user_id"], bet]):
+    # Escrow the challenger's stake up front (epoch-stamped: the debit and its
+    # refund share one epoch); refunded on decline/expiry.
+    if bet and not ctx.sql.execute(_COINS_SUB_GUARDED_EPOCH,
+                                   [name, bet, player["user_id"], bet, _epoch(player)]):
         _try_respond(ctx, f"You can't cover a **{bet:,} {game.CURRENCY}** stake — "
                           f"you carry **{player['coins']:,}**.")
         return
     duel_id = str(event.get("interaction_id") or now)
     target_name = target["username"] or f"Hero {target_id[-4:]}"
     try:
-        ctx.sql.execute(_OPEN_DUEL,
-                        [duel_id, player["user_id"], target_id, name, target_name,
-                         bet, str(event.get("channel_id") or ""), now])
+        opened = ctx.sql.execute(
+            _OPEN_DUEL,
+            [duel_id, player["user_id"], target_id, name, target_name,
+             bet, str(event.get("channel_id") or ""), now, _epoch(player),
+             player["user_id"], _epoch(player)])
     except (SdkError, RuntimeError):
-        # One open challenge per challenger (unique index) — return the stake.
+        opened = -1  # unique-index collision: another live challenge exists
+    if opened <= 0:
+        # Refund through the epoch guard: if the character Rekindled mid-
+        # handler (opened == 0), the pre-burn stake stays burned.
         if bet:
-            ctx.sql.execute(_CREDIT_COINS, [name, bet, player["user_id"]])
+            ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                            [name, bet, player["user_id"], _epoch(player)])
         _try_respond(ctx, "You already have an open challenge — it must be answered "
-                          "or go cold (5m) first.")
+                          "or go cold (5m) first." if opened == -1 else
+                          "The flames shifted mid-challenge — try **/duel** again.")
         return
     stakes = (f"Stakes: **{bet:,} {game.CURRENCY} each** — winner takes the pot."
               if bet else "An honor bout — no Embers at stake.")
@@ -1899,6 +2084,14 @@ def comp_duel_accept(ctx, event):
             ctx.sql.execute(_DUEL_FINISH, [duel_id])
             _try_respond(ctx, "Your challenger has vanished into the ash — no duel today.")
             return
+        if int(duel.get("epoch") or 0) != _epoch(challenger):
+            # The challenger Rekindled since staking: the challenge (and its
+            # escrow) belongs to a character that no longer exists. Burn it.
+            if ctx.sql.execute(_DUEL_VOID_RESOLVING, [duel_id]):
+                _quietly(_refund_duel_stake, ctx, duel)  # epoch-guarded: burns
+            _try_respond(ctx, "🔥 Your challenger's flame has burned out since the "
+                              "challenge was made — it dissolves to ash.")
+            return
         # Claim BOTH fighters' cooldowns atomically before any money moves —
         # a read-then-set check would let either side double-duel in a race.
         if not _claim_duel_cooldown(ctx, target["user_id"], now):
@@ -1954,14 +2147,16 @@ def comp_duel_accept(ctx, event):
             if voided:  # each refund is walled on its own — none may block another
                 _quietly(_refund_duel_stake, ctx, duel)
                 if target_debited:
-                    _quietly(ctx.sql.execute, _CREDIT_COINS,
-                             [target_name, bet, target["user_id"]])
+                    _quietly(ctx.sql.execute, _CREDIT_COINS_EPOCH,
+                             [target_name, bet, target["user_id"], _epoch(target)])
                 if target_cd_claimed:
                     _quietly(ctx.sql.execute, _REFUND_DUEL_COOLDOWN, [target["user_id"]])
                 if challenger_cd_claimed:
                     _quietly(ctx.sql.execute, _REFUND_DUEL_COOLDOWN, [duel["challenger_id"]])
         raise  # _safe answers the user
     ctx.metrics.record("duels_resolved", tags={"wagered": str(bet > 0)})
+    _quietly(_quest_event, ctx, duel["challenger_id"], "duel", now)
+    _quietly(_quest_event, ctx, target["user_id"], "duel", now)
 
     odds = result["chance"] if result["challenger_wins"] else 1 - result["chance"]
     description = (f"**{winner_name}** defeats **{loser_name}** "
@@ -2011,7 +2206,12 @@ def comp_duel_decline(ctx, event):
 # --- /trade: player-to-player sales (Phase 3) ---------------------------------------------------
 
 def _refund_trade_escrow(ctx, trade):
-    _add_item(ctx, trade["seller_id"], trade["item_id"], int(trade["qty"]))
+    # Epoch-guarded: goods escrowed before a Rekindling burn with the rest.
+    returned = _add_item(ctx, trade["seller_id"], trade["item_id"], int(trade["qty"]),
+                         epoch=int(trade.get("epoch") or 0))
+    if returned and game.ITEMS.get(trade["item_id"], {}).get("kind") == "pet":
+        # A companion coming home re-leashes itself if the leash is empty.
+        ctx.sql.execute(_ADOPT_IF_PETLESS, [trade["item_id"], trade["seller_id"]])
 
 
 def _expire_trade_if_stale(ctx, trade, now) -> bool:
@@ -2077,17 +2277,18 @@ def cmd_trade(ctx, event):
         return
     item = game.ITEMS[item_id]
     name = _username(event) or player["username"]
-    # Escrow the goods out of the seller's satchel; refunded on every exit path.
-    if not ctx.sql.execute(_INVENTORY_TAKE_N,
-                           [qty, player["user_id"], item_id, qty]):
+    # Escrow the goods out of the seller's satchel (epoch-stamped: the take and
+    # its refund share one epoch); refunded on every exit path.
+    if not ctx.sql.execute(_INVENTORY_TAKE_N_EPOCH,
+                           [qty, player["user_id"], item_id, qty,
+                            player["user_id"], _epoch(player)]):
         _try_respond(ctx, f"You don't carry **{item['name']} ×{qty}** to offer.")
         return
     unstrap_note = ""
+    # Unconditional CAS (no stale-row precondition): offered-away gear or a
+    # crated companion must never leave its stats/perk active mid-escrow.
     if (item["kind"] in ("sword", "armor")
-            and player[_equipped_column(item["kind"])] == item_id
             and _item_qty(ctx, player["user_id"], item_id) <= 0):
-        # Offering away your equipped gear unstraps it — its stats (and any
-        # enchant) must not linger on the player while the item sits in escrow.
         column = _equipped_column(item["kind"])
         owned = ctx.sql.query(
             "SELECT item_id FROM inventory WHERE user_id = %s AND qty > 0",
@@ -2098,15 +2299,25 @@ def cmd_trade(ctx, event):
                            [name, fallback, player["user_id"], item_id]):
             unstrap_note = (f"\n*(You unstrap it first — back to your "
                             f"{game.ITEMS[fallback]['name']}.)*")
+    elif (item["kind"] == "pet"
+            and _item_qty(ctx, player["user_id"], item_id) <= 0):
+        if ctx.sql.execute(_CLEAR_PET_CAS, [player["user_id"], item_id]):
+            unstrap_note = "\n*(Your companion waits in the trade crate — perk suspended.)*"
     trade_id = str(event.get("interaction_id") or now)
     try:
-        ctx.sql.execute(_OPEN_TRADE,
-                        [trade_id, player["user_id"], buyer_id, name, item_id, qty,
-                         price, str(event.get("channel_id") or ""), now])
+        opened = ctx.sql.execute(
+            _OPEN_TRADE,
+            [trade_id, player["user_id"], buyer_id, name, item_id, qty,
+             price, str(event.get("channel_id") or ""), now, _epoch(player),
+             player["user_id"], _epoch(player)])
     except (SdkError, RuntimeError):
-        _add_item(ctx, player["user_id"], item_id, qty)  # one open offer per seller
+        opened = -1  # unique-index collision: another live offer exists
+    if opened <= 0:
+        # Epoch-guarded return: goods taken from a since-Rekindled character burn.
+        _add_item(ctx, player["user_id"], item_id, qty, epoch=_epoch(player))
         _try_respond(ctx, "You already have an open offer — cancel it or let it lapse "
-                          "(10m) first.")
+                          "(10m) first." if opened == -1 else
+                          "The flames shifted mid-offer — try **/trade** again.")
         return
     buyer_name = buyer["username"] or f"Hero {buyer_id[-4:]}"
     deal = (f"**{item['emoji']} {item['name']} ×{qty}** for **{price:,} {game.CURRENCY}**"
@@ -2151,6 +2362,15 @@ def comp_trade_accept(ctx, event):
     buyer_debited = False
     granted = False
     try:
+        seller = _get_player(ctx, trade["seller_id"])
+        if seller is None or int(trade.get("epoch") or 0) != _epoch(seller):
+            # The seller Rekindled since offering: the goods belong to a burned
+            # character. Void the offer before taking the buyer's coins.
+            if ctx.sql.execute(_TRADE_VOID_RESOLVING, [trade_id]):
+                _quietly(_refund_trade_escrow, ctx, trade)  # epoch-guarded: burns
+            _try_respond(ctx, "🔥 The seller's flame has burned out since this offer "
+                              "was made — the goods are gone to ash.")
+            return
         if price and not ctx.sql.execute(_COINS_SUB_GUARDED,
                                          [buyer_name, price, buyer["user_id"], price]):
             still_open = _reopen_or_void_trade(ctx, trade)
@@ -2159,10 +2379,13 @@ def comp_trade_accept(ctx, event):
                             else " — the offer has lapsed; the goods went home."))
             return
         buyer_debited = price > 0
-        _add_item(ctx, buyer["user_id"], trade["item_id"], int(trade["qty"]))
+        _add_item(ctx, buyer["user_id"], trade["item_id"], int(trade["qty"]),
+                  epoch=_epoch(buyer))
         granted = True
         if price:
-            ctx.sql.execute(_CREDIT_COINS, [trade["seller_name"], price, trade["seller_id"]])
+            ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                            [trade["seller_name"], price, trade["seller_id"],
+                             int(trade.get("epoch") or 0)])
         ctx.sql.execute(_TRADE_FINISH, [trade_id])
     except (SdkError, RuntimeError):
         if granted:
@@ -2176,8 +2399,8 @@ def comp_trade_accept(ctx, event):
                 pass
             if voided:  # each refund is walled on its own — none may block another
                 if buyer_debited:
-                    _quietly(ctx.sql.execute, _CREDIT_COINS,
-                             [buyer_name, price, buyer["user_id"]])
+                    _quietly(ctx.sql.execute, _CREDIT_COINS_EPOCH,
+                             [buyer_name, price, buyer["user_id"], _epoch(buyer)])
                 _quietly(_refund_trade_escrow, ctx, trade)
         raise  # _safe answers the user
     ctx.metrics.record("trades_resolved")
@@ -2321,21 +2544,27 @@ def _guild_create(ctx, event, state, name):
     guild_inserted = False
     try:
         if not ctx.sql.execute(_GUILD_INSERT, [key, display, player["user_id"], now]):
-            ctx.sql.execute(_CREDIT_COINS, [username, game.GUILD_CREATE_COST, player["user_id"]])
+            ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                            [username, game.GUILD_CREATE_COST, player["user_id"],
+                             _epoch(player)])
             _try_respond(ctx, f"A guild already bears the name **{display}**.")
             return
         guild_inserted = True
         if not ctx.sql.execute(_GUILD_MEMBER_INSERT,
                                [player["user_id"], key, username, now]):
             _unwind_guild_shell(ctx, key, player["user_id"])
-            ctx.sql.execute(_CREDIT_COINS, [username, game.GUILD_CREATE_COST, player["user_id"]])
+            ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                            [username, game.GUILD_CREATE_COST, player["user_id"],
+                             _epoch(player)])
             _try_respond(ctx, "You're already sworn to a guild — **/guild action:leave** first.")
             return
     except (SdkError, RuntimeError):
         try:
             if guild_inserted:
                 _unwind_guild_shell(ctx, key, player["user_id"])
-            ctx.sql.execute(_CREDIT_COINS, [username, game.GUILD_CREATE_COST, player["user_id"]])
+            ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                            [username, game.GUILD_CREATE_COST, player["user_id"],
+                             _epoch(player)])
         except (SdkError, RuntimeError):
             pass
         raise
@@ -2486,6 +2715,9 @@ def _pay_out_arena_day(ctx, day, multiplier):
         prize = payouts[i] if i < len(payouts) else 0
         if prize:
             try:
+                # Deliberately NOT epoch-guarded: a prize is income already
+                # earned on the sand — it survives a Rekindling (the confirm
+                # screen says so), unlike held coins, which burn.
                 ctx.sql.execute(_CREDIT_COINS, [entry["username"], prize, entry["user_id"]])
             except (SdkError, RuntimeError) as exc:
                 # One failed payout must not rob the rest of the podium.
@@ -2548,12 +2780,14 @@ def _do_arena_enter(ctx, event, state, today):
         _try_respond(ctx, f"The arena's entry fee is **{game.ARENA_FEE} {game.CURRENCY}** — "
                           f"you carry **{player['coins']:,}**.")
         return
-    score = game.arena_score(player["level"], _player_atk(player),
-                             _player_defense(player), _rng)
+    score = (game.arena_score(player["level"], _player_atk(player),
+                              _player_defense(player), _rng)
+             + int(_boosts_for(player, now)["arena"]))
     if not ctx.sql.execute(_ARENA_ENTER,
                            [today, player["user_id"], username, score, game.ARENA_FEE,
                             str(event.get("channel_id") or ""), now, today]):
-        ctx.sql.execute(_CREDIT_COINS, [username, game.ARENA_FEE, player["user_id"]])
+        ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                        [username, game.ARENA_FEE, player["user_id"], _epoch(player)])
         already = ctx.sql.query_one(
             "SELECT 1 AS x FROM arena_entries WHERE day = %s AND user_id = %s",
             [today, player["user_id"]])
@@ -2566,6 +2800,7 @@ def _do_arena_enter(ctx, event, state, today):
         return
     _settle_social(ctx, player, game.ARENA_XP)
     ctx.metrics.record("arena_entries")
+    _quietly(_quest_event, ctx, player["user_id"], "arena", now)
     _arena_standings(ctx, today, player, state["multiplier"], just_entered=score)
 
 
@@ -2608,6 +2843,466 @@ def comp_arena_join(ctx, event):
                           f"results come when the day turns.")
         return
     _do_arena_enter(ctx, event, state, today)
+
+
+# --- /equip: free gear switching (Phase 4) ---------------------------------------------------
+
+@plugin.on_slash_command("equip")
+@_safe
+def cmd_equip(ctx, event):
+    state = _begin(ctx, event, "equip")
+    if state is None:
+        return
+    player = state["player"]
+    item_id = game.find_item(_options(event).get("item"))
+    if item_id is None or game.ITEMS[item_id]["kind"] not in ("sword", "armor"):
+        _try_respond(ctx, "You can equip swords and armor — see **/inventory** for what you own.")
+        return
+    item = game.ITEMS[item_id]
+    column = _equipped_column(item["kind"])
+    if player[column] == item_id:
+        _try_respond(ctx, f"Your {item['name']} is already equipped.")
+        return
+    # The bare defaults are always available; everything else must be owned.
+    if (item_id not in (game.DEFAULT_SWORD, game.DEFAULT_ARMOR)
+            and _item_qty(ctx, player["user_id"], item_id) < 1):
+        _try_respond(ctx, f"You don't own a **{item['name']}** — find one in **/shop**, "
+                          f"**/craft**, or a trade.")
+        return
+    old_enchant = int(player.get(f"{column}_enchant") or 0)
+    name = _username(event) or player["username"]
+    if item_id in (game.DEFAULT_SWORD, game.DEFAULT_ARMOR):
+        swapped = ctx.sql.execute(_EQUIP_CAS[column],
+                                  [name, item_id, player["user_id"], player[column]])
+    else:
+        swapped = ctx.sql.execute(
+            _EQUIP_OWNED_CAS[column],
+            [name, item_id, player["user_id"], player[column],
+             player["user_id"], item_id])
+    if not swapped:
+        _try_respond(ctx, "Your gear shifted mid-swap — try again.")
+        return
+    fresh = _get_player(ctx, player["user_id"]) or player
+    note = "\n*(The old enchantment fades with the swap.)*" if old_enchant else ""
+    ctx.interaction.respond(embeds=[_embed(
+        f"{item['emoji']} Equipped: {item['name']}",
+        f"Now wielding {_gear_label(fresh, column)}.{note}",
+    )], ephemeral=True)
+
+
+# --- /pet: companions (Phase 4) ----------------------------------------------------------------
+
+def _owned_pets(ctx, user_id):
+    owned = _materials_of(ctx, user_id)  # all inventory rows with qty > 0
+    return [pid for pid in game.PET_PERKS if owned.get(pid, 0) > 0]
+
+
+def _set_active_pet(ctx, event, state, pet_id):
+    player = state["player"]
+    pet = game.ITEMS[pet_id]
+    if player.get("pet") == pet_id:
+        _try_respond(ctx, f"{pet['emoji']} Your {pet['name']} already trots beside you.")
+        return
+    # Ownership is proven inside the statement — a companion sliding into a
+    # trade crate at this very instant can't end up active on two leashes.
+    if not ctx.sql.execute(_SET_PET_OWNED,
+                           [pet_id, player["user_id"], player["user_id"], pet_id]):
+        _try_respond(ctx, f"No {pet['name']} answers your whistle — companions hatch "
+                          f"from Ember Caches (**/open**).")
+        return
+    ctx.interaction.respond(embeds=[_embed(
+        f"{pet['emoji']} {pet['name']} takes the lead!",
+        f"Perk active: **{game.PET_PERKS[pet_id]['label']}**.",
+    )], ephemeral=True)
+
+
+@plugin.on_slash_command("pet")
+@_safe
+def cmd_pet(ctx, event):
+    state = _begin(ctx, event, "pet")
+    if state is None:
+        return
+    player = state["player"]
+    query = _options(event).get("name")
+    if query:
+        pet_id = game.find_item(query)
+        if pet_id is None or game.ITEMS[pet_id]["kind"] != "pet":
+            _try_respond(ctx, "No such companion — try **/pet** to see who walks with you.")
+            return
+        _set_active_pet(ctx, event, state, pet_id)
+        return
+    owned = _owned_pets(ctx, player["user_id"])
+    active = player.get("pet") or ""
+    lines = []
+    buttons = []
+    for pet_id in owned:
+        pet = game.ITEMS[pet_id]
+        marker = "▸ " if pet_id == active else ""
+        lines.append(f"{marker}{pet['emoji']} **{pet['name']}** — "
+                     f"{game.PET_PERKS[pet_id]['label']}")
+        if pet_id != active:
+            buttons.append(Button(pet["name"], f"{PET_SET_PREFIX}{pet_id}:{player['user_id']}",
+                                  style="secondary", emoji=pet["emoji"]))
+    description = ("\n".join(lines) if lines else
+                   "*No companions yet — they hatch from Ember Caches (**/open**), "
+                   "and the wilds say dungeon caches hold the rarest.*")
+    if active and active in game.PET_PERKS:
+        description = (f"Walking with you: {game.ITEMS[active]['emoji']} "
+                       f"**{game.ITEMS[active]['name']}**\n\n") + description
+    ctx.interaction.respond(
+        embeds=[_embed("🐾 Your Companions", description)],
+        components=[ActionRow(*buttons[:5])] if buttons else None,
+        ephemeral=True,
+    )
+
+
+@plugin.on_component(prefix=PET_SET_PREFIX)
+@_safe
+def comp_pet_set(ctx, event):
+    rest = _owner_of(event, PET_SET_PREFIX)
+    pet_id, _, owner = rest.partition(":")
+    if str(event.get("user_id")) != owner:
+        _try_respond(ctx, "🐾 That leash isn't yours — see **/pet** for your own companions.")
+        return
+    state = _begin(ctx, event, "pet_set")
+    if state is None:
+        return
+    if pet_id not in game.PET_PERKS:
+        _try_respond(ctx, "No such companion.")
+        return
+    _set_active_pet(ctx, event, state, pet_id)
+
+
+# --- /open: Ember Caches (Phase 4) ----------------------------------------------------------------
+
+def _odds_embed():
+    """Honest odds for EVERY cache — published before a single Ember is spent."""
+    sections = []
+    for box_id in game.LOOT_TABLES:
+        item = game.ITEMS[box_id]
+        rows = "\n".join(f"`{weight:>2}%` {label}"
+                         for weight, label in game.lootbox_odds(box_id))
+        sections.append(f"**{item['emoji']} {item['name']}**\n{rows}")
+    return _embed(
+        "📊 Cache odds — what's inside?",
+        "\n\n".join(sections) + "\n\nEmber Caches are sold in **/shop** (Curios); "
+                                "Blazing Caches drop from dungeon minibosses.",
+        footer=game.VIRTUAL_NOTE,
+    )
+
+
+def _do_open(ctx, event, state, box_id):
+    player = state["player"]
+    now = _now()
+    box = game.ITEMS[box_id]
+    name = _username(event) or player["username"]
+    if not _take_item(ctx, player["user_id"], box_id):
+        _try_respond(ctx, f"No {box['name']} in your satchel — Ember Caches are sold in "
+                          f"**/shop** (Curios).")
+        return
+    result = game.roll_lootbox(box_id, _rng, _owned_pets(ctx, player["user_id"]))
+
+    public = False
+    if result["kind"] == "coins":
+        ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                        [name, result["amount"], player["user_id"], _epoch(player)])
+        if result.get("jackpot"):
+            public = True
+            description = (f"🎰 **JACKPOT!** The cache overflows: "
+                           f"**+{result['amount']:,} {game.CURRENCY}**!")
+        elif result.get("duplicate_pet"):
+            dup = game.ITEMS[result["duplicate_pet"]]
+            description = (f"A {dup['emoji']} {dup['name']} peeks out — but one already "
+                           f"walks with you. It leaves **+{result['amount']:,} "
+                           f"{game.CURRENCY}** and slips away.")
+        else:
+            description = f"Embers spill out: **+{result['amount']:,} {game.CURRENCY}**."
+    elif result["kind"] == "item":
+        _add_item(ctx, player["user_id"], result["item_id"], result["count"],
+                  epoch=_epoch(player))
+        item = game.ITEMS[result["item_id"]]
+        description = f"Inside: {item['emoji']} **{item['name']} ×{result['count']}**."
+    else:  # a new companion!
+        _add_item(ctx, player["user_id"], result["item_id"], epoch=_epoch(player))
+        pet = game.ITEMS[result["item_id"]]
+        # Re-check AFTER the grant: a concurrent open (or an owned-list read
+        # gone stale) may have hatched the same companion — convert the extra.
+        if _item_qty(ctx, player["user_id"], result["item_id"]) > 1:
+            if _take_item(ctx, player["user_id"], result["item_id"]):
+                ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                                [name, game.DUPLICATE_PET_COINS, player["user_id"],
+                                 _epoch(player)])
+            description = (f"A {pet['emoji']} {pet['name']} peeks out — but one already "
+                           f"walks with you. It leaves **+{game.DUPLICATE_PET_COINS:,} "
+                           f"{game.CURRENCY}** and slips away.")
+        else:
+            ctx.sql.execute(_ADOPT_IF_PETLESS, [result["item_id"], player["user_id"]])
+            public = True
+            description = (f"🐾 A {pet['emoji']} **{pet['name']}** bounds out of the cache!\n"
+                           f"Perk: {game.PET_PERKS[result['item_id']]['label']} — "
+                           f"manage companions with **/pet**.")
+    ctx.metrics.record("caches_opened", tags={"cache": box_id})
+
+    remaining = _item_qty(ctx, player["user_id"], box_id)
+    components = [ActionRow(Button(
+        f"Open another ({remaining} left)" if remaining else "Open another",
+        f"{LOOT_AGAIN_PREFIX}{box_id}:{player['user_id']}",
+        style="primary", emoji=box["emoji"], disabled=remaining <= 0,
+    ))]
+    ctx.interaction.respond(
+        embeds=[_embed(f"{box['emoji']} {box['name']} creaks open…", description,
+                       footer=game.VIRTUAL_NOTE)],
+        components=components,
+        ephemeral=not public,
+    )
+
+
+@plugin.on_slash_command("open")
+@_safe
+def cmd_open(ctx, event):
+    state = _begin(ctx, event, "open")
+    if state is None:
+        return
+    player = state["player"]
+    query = _options(event).get("item")
+    if query:
+        box_id = game.find_item(query)
+        if box_id is None or box_id not in game.LOOT_TABLES:
+            _try_respond(ctx, "Only caches can be cracked open — **/open** with an empty "
+                              "hand shows what's on offer.")
+            return
+    else:
+        owned = _materials_of(ctx, player["user_id"])
+        box_id = next((b for b in game.LOOT_TABLES if owned.get(b, 0) > 0), None)
+        if box_id is None:
+            ctx.interaction.respond(embeds=[_odds_embed()], ephemeral=True)
+            return
+    _do_open(ctx, event, state, box_id)
+
+
+@plugin.on_component(prefix=LOOT_AGAIN_PREFIX)
+@_safe
+def comp_loot_again(ctx, event):
+    rest = _owner_of(event, LOOT_AGAIN_PREFIX)
+    box_id, _, owner = rest.partition(":")
+    if str(event.get("user_id")) != owner:
+        _try_respond(ctx, "📦 That cache isn't yours — buy your own in **/shop**.")
+        return
+    state = _begin(ctx, event, "open_again")
+    if state is None:
+        return
+    if box_id not in game.LOOT_TABLES:
+        _try_respond(ctx, "That cache crumbled to ash.")
+        return
+    _do_open(ctx, event, state, box_id)
+
+
+# --- /quests: the daily board (Phase 4) --------------------------------------------------------------
+
+@plugin.on_slash_command("quests")
+@_safe
+def cmd_quests(ctx, event):
+    state = _begin(ctx, event, "quests")
+    if state is None:
+        return
+    player = state["player"]
+    now = _now()
+    day = game.arena_day(now)
+    ctx.sql.execute(_PRUNE_QUESTS, [game.arena_day(now - game.QUEST_PRUNE_DAYS * 86400)])
+
+    quests = game.daily_quests(player["user_id"], day)
+    rows = ctx.sql.query(
+        "SELECT quest_idx, progress, claimed FROM quest_progress "
+        "WHERE user_id = %s AND day = %s",
+        [player["user_id"], day], limit=10,
+    )
+    by_idx = {int(r["quest_idx"]): r for r in rows}
+    boosts = _boosts_for(player, now)
+
+    lines = []
+    buttons = []
+    for idx, quest in enumerate(quests):
+        row = by_idx.get(idx, {})
+        progress = min(int(row.get("progress") or 0), quest["target"])
+        claimed = int(row.get("claimed") or 0)
+        reward = game.quest_reward(quest, player["level"], boosts)
+        bar = game.progress_bar(progress, quest["target"], width=6)
+        if claimed:
+            lines.append(f"✅ ~~{quest['desc']}~~ — claimed")
+        elif progress >= quest["target"]:
+            lines.append(f"🎁 **{quest['desc']}** — `{bar}` done! "
+                         f"Claim **{reward:,} {game.CURRENCY}** + {game.QUEST_XP} XP")
+            buttons.append(Button(f"Claim quest {idx + 1}",
+                                  f"{QUEST_CLAIM_PREFIX}{idx}:{player['user_id']}",
+                                  style="success", emoji="🎁"))
+        else:
+            lines.append(f"▫️ {quest['desc']} — `{bar}` {progress}/{quest['target']} · "
+                         f"{reward:,} {game.CURRENCY}")
+    season = game.current_season(now)
+    banner = (f"{season['emoji']} **{_cap(season['name'])}** burns until further notice — "
+              f"+25% Embers & XP on hunts, adventures, and dailies!\n\n" if season else "")
+    ctx.interaction.respond(
+        embeds=[_embed(
+            f"📜 The Quest Board — {day}",
+            banner + "\n".join(lines) + "\n\nThe board redraws when the day turns (UTC).",
+            footer=game.VIRTUAL_NOTE,
+        )],
+        components=[ActionRow(*buttons[:5])] if buttons else None,
+        ephemeral=True,
+    )
+
+
+@plugin.on_component(prefix=QUEST_CLAIM_PREFIX)
+@_safe
+def comp_quest_claim(ctx, event):
+    rest = _owner_of(event, QUEST_CLAIM_PREFIX)
+    idx_str, _, owner = rest.partition(":")
+    if str(event.get("user_id")) != owner:
+        _try_respond(ctx, "📜 That board isn't yours — **/quests** shows your own.")
+        return
+    state = _begin(ctx, event, "quest_claim")
+    if state is None:
+        return
+    player = state["player"]
+    now = _now()
+    day = game.arena_day(now)
+    quests = game.daily_quests(player["user_id"], day)
+    try:
+        quest = quests[int(idx_str)]
+    except (ValueError, IndexError):
+        _try_respond(ctx, "📜 That quest faded with yesterday's board — see **/quests**.")
+        return
+    # Quest progress deliberately survives a Rekindling: a completed quest is
+    # income already earned (the confirm screen says so); the claim below pays
+    # at the CURRENT epoch and level, so nothing pre-burn is resurrected.
+    if not ctx.sql.execute(_QUEST_CLAIM_CAS,
+                           [player["user_id"], day, int(idx_str), quest["target"]]):
+        _try_respond(ctx, "📜 Not finished yet — or already claimed. **/quests** has the tally.")
+        return
+    reward = game.quest_reward(quest, player["level"], _boosts_for(player, now))
+    ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                    [_username(event) or player["username"], reward, player["user_id"],
+                     _epoch(player)])
+    _settle_social(ctx, player, game.QUEST_XP)
+    ctx.metrics.record("quests_claimed")
+    ctx.interaction.respond(embeds=[_embed(
+        "🎁 Quest complete!",
+        f"*{quest['desc']}* — **+{reward:,} {game.CURRENCY}** and **+{game.QUEST_XP} XP**.",
+        footer=game.VIRTUAL_NOTE,
+    )], ephemeral=True)
+
+
+# --- /rekindle: prestige (Phase 4) ---------------------------------------------------------------------
+
+@plugin.on_slash_command("rekindle")
+@_safe
+def cmd_rekindle(ctx, event):
+    state = _begin(ctx, event, "rekindle")
+    if state is None:
+        return
+    player = state["player"]
+    flames = int(player.get("rekindles") or 0)
+    bonus_now = round(game.REKINDLE_BONUS_PER * min(flames, game.REKINDLE_BONUS_CAP) * 100)
+    if player["level"] < game.REKINDLE_MIN_LEVEL:
+        _try_respond(ctx, f"🔥 The heartfire answers only heroes of level "
+                          f"**{game.REKINDLE_MIN_LEVEL}+** — you burn at "
+                          f"**{player['level']}**."
+                          + (f" (Current Rekindling bonus: +{bonus_now}%.)" if flames else ""))
+        return
+    pet_note = ""
+    pet_id = player.get("pet") or ""
+    if pet_id in game.PET_PERKS:
+        pet_note = (f"\n• Your active companion, "
+                    f"{game.ITEMS[pet_id]['emoji']} {game.ITEMS[pet_id]['name']}, "
+                    f"**stays at your side**")
+    next_bonus = round(game.REKINDLE_BONUS_PER
+                       * min(flames + 1, game.REKINDLE_BONUS_CAP) * 100)
+    if flames >= game.REKINDLE_BONUS_CAP:
+        gain_line = (f"Your bonus already burns at its **+{next_bonus}% cap** — "
+                     f"further flames are marks of pride alone, shown beside your name.")
+    else:
+        gain_line = (f"You gain a permanent flame: **+{next_bonus}% Embers & XP** "
+                     f"(stacks to {game.REKINDLE_BONUS_CAP}) and a 🔥 mark beside your name.")
+    ctx.interaction.respond(
+        embeds=[_embed(
+            "🔥 Rekindle your flame?",
+            "Returning to the heartfire **cannot be undone**. You will lose:\n"
+            "• Level, XP, HP — back to a fresh level 1\n"
+            f"• **All {game.CURRENCY}**\n"
+            "• Equipped gear and enchantments\n"
+            "• Your entire satchel — items, materials, caches, and idle companions\n"
+            "• Any open duel challenges or trade offers (withdrawn — their stakes burn too)"
+            f"{pet_note}\n"
+            "• Kept: your guild, your daily timer, and winnings already earned "
+            "(arena prizes, completed quests)\n\n"
+            + gain_line,
+            footer=game.VIRTUAL_NOTE,
+        )],
+        components=[ActionRow(Button(
+            "Burn it all and begin again",
+            f"{REKINDLE_CONFIRM_PREFIX}{player['user_id']}",
+            style="danger", emoji="🔥",
+        ))],
+        ephemeral=True,
+    )
+
+
+def _void_player_escrows(ctx, player):
+    """Withdraw the player's open challenges and offers. Runs AFTER a
+    successful reset: every refund is epoch-guarded against the row's
+    pre-burn epoch, so the stakes burn instead of resurrecting — this just
+    closes the rows so counterparties see them as gone."""
+    for duel in ctx.sql.query(
+            "SELECT * FROM duels WHERE challenger_id = %s AND status = 'open'",
+            [player["user_id"]], limit=5):
+        if ctx.sql.execute(_DUEL_EXPIRE_CAS, [duel["id"]]):
+            _quietly(_refund_duel_stake, ctx, duel)
+    for trade in ctx.sql.query(
+            "SELECT * FROM trades WHERE seller_id = %s AND status = 'open'",
+            [player["user_id"]], limit=5):
+        if ctx.sql.execute(_TRADE_EXPIRE_CAS, [trade["id"]]):
+            _quietly(_refund_trade_escrow, ctx, trade)
+
+
+@plugin.on_component(prefix=REKINDLE_CONFIRM_PREFIX)
+@_safe
+def comp_rekindle_confirm(ctx, event):
+    if str(event.get("user_id")) != _owner_of(event, REKINDLE_CONFIRM_PREFIX):
+        _try_respond(ctx, "🔥 That flame isn't yours to rekindle.")
+        return
+    state = _begin(ctx, event, "rekindle_confirm")
+    if state is None:
+        return
+    player = state["player"]
+    now = _now()
+    # ONE guarded statement: level gate + rekindle increment land together, so
+    # a stale or double-pressed confirm can never fire twice. Nothing is
+    # touched before this gate — an ineligible press has zero side effects.
+    if not ctx.sql.execute(_REKINDLE_RESET,
+                           [now, player["user_id"], game.REKINDLE_MIN_LEVEL]):
+        _try_respond(ctx, f"🔥 The fire isn't ready — Rekindling needs level "
+                          f"**{game.REKINDLE_MIN_LEVEL}+** (a fresh flame starts at 1).")
+        return
+    # The companion to spare comes from a FRESH read — the stale pre-reset row
+    # could name a pet swapped (or escrowed away) mid-confirmation.
+    fresh_keep = _get_player(ctx, player["user_id"]) or player
+    keep = fresh_keep.get("pet") or ""
+    ctx.sql.execute(_WIPE_INVENTORY_EXCEPT, [player["user_id"], keep])
+    # Close out open challenges/offers AFTER the burn: their epoch-guarded
+    # refunds land in the void, exactly as the warning promised.
+    _quietly(_void_player_escrows, ctx, player)
+    ctx.metrics.record("rekindled")
+    fresh = _get_player(ctx, player["user_id"]) or player
+    flames = int(fresh.get("rekindles") or 0)
+    bonus = round(game.REKINDLE_BONUS_PER * min(flames, game.REKINDLE_BONUS_CAP) * 100)
+    name = _username(event) or player["username"]
+    ctx.interaction.respond(embeds=[_embed(
+        f"🔥 {name or 'A hero'} rekindles their flame! (×{flames})",
+        f"Everything burns away — and from the ash, a brighter ember: "
+        f"**+{bonus}% Embers & XP**, forever.\n"
+        f"The Cinderwilds await a fresh **/hunt**.",
+        footer=game.VIRTUAL_NOTE,
+    )])
 
 
 # --- Dashboard -----------------------------------------------------------------------------
@@ -2658,6 +3353,12 @@ def dash_dungeons_cleared(ctx, params):
 @plugin.on_dashboard("get_duels_fought")
 def dash_duels_fought(ctx, params):
     return {"value": int(ctx.metrics.total("duels_resolved", period="30d") or 0),
+            "change": ""}
+
+
+@plugin.on_dashboard("get_caches_opened")
+def dash_caches_opened(ctx, params):
+    return {"value": int(ctx.metrics.total("caches_opened", period="30d") or 0),
             "change": ""}
 
 

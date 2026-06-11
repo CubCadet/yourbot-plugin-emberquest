@@ -4,11 +4,13 @@
 
 An original Discord RPG/economy game for the [YourBot.gg](https://yourbot.gg) plugin platform.
 Hunt ash-born monsters in the Cinderwilds, raid dungeon minibosses with your party, duel rivals,
-trade with friends, found guilds, fight in the daily arena, craft and enchant gear, and climb your
-server's leaderboard — with a real admin dashboard for live stats and a tunable economy.
+trade with friends, found guilds, fight in the daily arena, hatch companions from Ember Caches,
+clear daily quests, chase seasonal events, Rekindle your legend for permanent bonuses, and climb
+your server's leaderboard — with a real admin dashboard for live stats and a tunable economy.
 
 > **Embers are virtual in-game currency with no real-world value.** All gambling-style features
-> (coinflip, duel stakes, arena fees) use Embers only and are labeled as such in-game.
+> (coinflip, duel stakes, arena fees, and Ember Cache lootboxes) use Embers only, are labeled as
+> such in-game, and the caches publish their exact drop odds before you spend anything (`/open`).
 
 ## Features
 
@@ -28,6 +30,16 @@ server's leaderboard — with a real admin dashboard for live stats and a tunabl
   leaderboard by combined levels.
 - **Daily arena** — one entry per UTC day, podium pays 50/30/20% of the prize pool, results
   broadcast automatically when the day turns.
+- **Companions** — pets hatch from Ember Caches, each with a distinct passive perk (+Embers,
+  +XP, +drop chance, +arena score, +quest rewards); tradeable like any item.
+- **Ember Caches** — lootboxes with **published odds**, bought in the shop or dropped by
+  dungeon minibosses; duplicate companions auto-convert to Embers.
+- **Daily quests** — three per hero per UTC day, derived deterministically (no quest storage,
+  only progress), with claim buttons and pet-boosted rewards.
+- **Rekindling** — the prestige loop: burn everything at level 20+ (your active companion
+  survives) for a permanent +10% Embers & XP per flame, stacking to +50%.
+- **Seasonal events** — four date-window festivals a year with +25% rewards and a seasonal
+  bonus creature stalking the hunts. No background jobs — pure date math.
 - **Admin dashboard** — player/command/economy stat cards, a 7-day activity chart, and a
   settings form (economy multiplier, channel restriction) — no bot restarts needed.
 
@@ -53,6 +65,11 @@ server's leaderboard — with a real admin dashboard for live stats and a tunabl
 | `/trade user: item: price: [qty:]` | Offer items to a player for Embers (0 = gift) |
 | `/guild action: [name:]` | `create`, `join`, `leave`, or `info` |
 | `/arena` | Enter today's tournament (50-Ember fee, daily) |
+| `/equip item:` | Equip any owned sword/armor (enchant resets on swap) |
+| `/pet [name:]` | See your companions or choose who walks beside you |
+| `/open [item:]` | Crack an Ember Cache — odds shown before you buy |
+| `/quests` | Today's three quests: progress, rewards, claims |
+| `/rekindle` | Prestige at level 20+ for a permanent reward bonus |
 
 ## Requirements
 
@@ -69,7 +86,7 @@ Built against **yourbot-sdk 0.6.1**. Everything runs locally — no Docker, no D
 uv venv .venv
 uv pip install --python .venv/bin/python "yourbot-sdk>=0.6.1,<0.7" pytest
 
-# run the test suite (134 tests)
+# run the test suite
 .venv/bin/python -m pytest tests/ -q
 
 # validate against the platform's pre-submit checks
@@ -106,8 +123,11 @@ built around single-statement atomicity:
   happens exactly once, with every compensation step independently error-walled.
 - One-open invariants (dungeon lobby, duel challenge, trade offer) are enforced with **partial
   unique indexes** whose predicates cover the transient `resolving` state.
-- No background jobs: cooldowns, lobby expiry, and arena payouts all resolve **lazily** on the
-  next relevant interaction.
+- The prestige reset treats `rekindles` as a **character epoch**: every settlement, grant, and
+  escrow refund derived from a stale read carries `AND rekindles = %s`, so value computed
+  against a character that has since been reborn burns instead of resurrecting.
+- No background jobs: cooldowns, lobby expiry, arena payouts, quest boards, and seasonal
+  windows all resolve **lazily** on the next relevant interaction.
 
 ### Packaging a release
 
@@ -132,7 +152,7 @@ root). Review turnaround is typically 1–3 business days.
 
 ## Versions
 
-See [CHANGELOG.md](CHANGELOG.md). Current: **0.3.0**.
+See [CHANGELOG.md](CHANGELOG.md). Current: **0.4.0**.
 
 ## License
 

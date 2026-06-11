@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0 — Phase 4: Progression & flavor (2026-06-12)
+
+- **Companions** (`/pet`): five pets with distinct passive perks, hatched from caches,
+  tradeable; the active companion's perk suspends while it sits in trade escrow.
+- **Ember Caches** (`/open`): lootboxes with fully published odds, buyable in the shop's new
+  Curios page or dropped by dungeon minibosses; duplicate companions convert to Embers; an
+  owner-scoped "Open another" button chains pulls.
+- **Daily quests** (`/quests`): three per hero per UTC day — the board is derived
+  deterministically from (day, hero), only progress is stored; hooks across hunts, adventures,
+  dungeons, duels, crafting, coinflips, healing, and the arena; CAS-gated claim buttons.
+- **Rekindling** (`/rekindle`): the prestige loop — at level 20+, a two-step confirmation burns
+  level, Embers, gear, enchants, and satchel (the active companion survives) for a permanent
+  +10% Embers & XP per flame (caps at five) and 🔥 marks on profile and leaderboard.
+- **Seasonal events**: four stateless UTC date-window festivals (+25% rewards) with seasonal
+  bonus creatures in hunts; banners on the quest board and profile.
+- **`/equip`**: swap to any owned sword/armor freely — ownership proven atomically.
+- Dashboard: "Caches opened (30d)" stat card.
+- Hardening from adversarial review (20 findings, incl. 1 blocker): `rekindles` is now a
+  character **epoch** — every settlement, grant, and escrow refund computed from a stale read
+  is epoch-guarded, so nothing can resurrect a freshly-Rekindled character's level or wealth
+  (concurrent settles, in-flight escrows, debit-then-grant flows all burn cleanly); /equip and
+  /pet prove ownership in-statement; sell/trade unstrap runs unconditionally; duplicate-pet
+  conversion re-checks post-grant; cache sourcing copy made true (dungeons now drop caches).
+
 ## 0.3.0 — Phase 3: Social (2026-06-11)
 
 - **PvP duels** (`/duel`): equal-stakes Ember wagers with full escrow (challenge → accept),

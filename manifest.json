@@ -1,8 +1,8 @@
 {
   "id": "emberquest",
   "name": "EmberQuest",
-  "version": "0.3.0",
-  "description": "An original Discord RPG set in the Cinderwilds — hunt ash-born monsters, raid dungeon minibosses with your party, duel rivals, trade with friends, found guilds, fight in the daily arena, craft and enchant gear, and gamble Embers (virtual currency, no real-world value). Includes an admin dashboard with live stats and a tunable economy.",
+  "version": "0.4.0",
+  "description": "An original Discord RPG set in the Cinderwilds — hunt ash-born monsters, raid dungeon minibosses with your party, duel rivals, trade with friends, found guilds, fight in the daily arena, hatch companions from Ember Caches, clear daily quests, chase seasonal events, and Rekindle your legend for permanent bonuses. Embers are virtual currency with no real-world value. Includes an admin dashboard with live stats and a tunable economy.",
   "author": "EmberStream Studio",
   "tags": ["rpg", "economy", "game", "fun"],
   "capabilities_required": ["interaction:respond", "storage:kv", "storage:sql", "discord:send_message"],
@@ -64,6 +64,20 @@
         { "name": "action", "description": "create, join, leave, or info", "type": 3, "required": true },
         { "name": "name", "description": "Guild name (for create/join/info)", "type": 3, "required": false }
       ] },
-    { "name": "arena", "description": "Enter today's arena tournament (daily, 50-Ember fee, virtual currency)" }
+    { "name": "arena", "description": "Enter today's arena tournament (daily, 50-Ember fee, virtual currency)" },
+    { "name": "equip", "description": "Equip any sword or armor you own (enchantments reset on swap)",
+      "options": [
+        { "name": "item", "description": "Gear to equip", "type": 3, "required": true }
+      ] },
+    { "name": "pet", "description": "See your companions or set who walks beside you",
+      "options": [
+        { "name": "name", "description": "Companion to make active", "type": 3, "required": false }
+      ] },
+    { "name": "open", "description": "Crack open an Ember Cache (odds shown in-game; virtual currency)",
+      "options": [
+        { "name": "item", "description": "Which cache to open (default: first owned)", "type": 3, "required": false }
+      ] },
+    { "name": "quests", "description": "Your three daily quests — progress, rewards, and claims" },
+    { "name": "rekindle", "description": "Prestige: burn your progress (level 20+) for a permanent reward bonus" }
   ]
 }

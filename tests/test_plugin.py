@@ -576,7 +576,7 @@ def test_shop_pages_and_owner_scoped_buttons(world):
     handlers.comp_shop_page(world.ctx, press(f"{handlers.SHOP_PAGE_PREFIX}1:{UID}"))
     assert "Armor" in text_of(last(world.ctx))
     handlers.comp_shop_page(world.ctx, press(f"{handlers.SHOP_PAGE_PREFIX}99:{UID}"))
-    assert "Potions" in text_of(last(world.ctx))  # page index clamps
+    assert "Curios" in text_of(last(world.ctx))  # page index clamps to the last page
     handlers.comp_shop_page(world.ctx, press(f"{handlers.SHOP_PAGE_PREFIX}1:{UID}", uid="999"))
     assert "your own catalog" in text_of(last(world.ctx))
 
@@ -868,10 +868,12 @@ def test_migration_upgrades_phase1_database(world):
     ctx.sql = FakeSql(conn)
     handlers.on_ready(ctx)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(players)")}
-    assert {"last_dungeon_at", "sword_enchant", "armor_enchant", "last_duel_at"} <= columns
+    assert {"last_dungeon_at", "sword_enchant", "armor_enchant", "last_duel_at",
+            "pet", "rekindles"} <= columns
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"dungeons", "dungeon_members", "duels", "trades",
-            "guilds", "guild_members", "arena_entries", "arena_days"} <= tables
+            "guilds", "guild_members", "arena_entries", "arena_days",
+            "quest_progress"} <= tables
     handlers.on_ready(ctx)  # idempotent re-run
 
 
@@ -1574,10 +1576,10 @@ def test_trade_settlement_failure_voids_and_refunds(world, monkeypatch):
     trade_setup(world, qty=2, price=100)
     real_add_item = handlers._add_item
 
-    def explode_for_buyer(ctx, user_id, item_id, amount=1):
+    def explode_for_buyer(ctx, user_id, item_id, amount=1, epoch=None):
         if user_id == "300":  # the grant fails; the seller's refund still works
             raise RuntimeError("RPC error (sql.execute): boom")
-        real_add_item(ctx, user_id, item_id, amount)
+        return real_add_item(ctx, user_id, item_id, amount, epoch=epoch)
 
     monkeypatch.setattr(handlers, "_add_item", explode_for_buyer)
     handlers.comp_trade_accept(world.ctx, press(f"{handlers.TRADE_ACCEPT_PREFIX}trade1", uid="300"))
@@ -1825,6 +1827,467 @@ def test_arena_pool_scales_with_multiplier(world):
     assert get_player(world, "A1")["coins"] == 125
 
 
+# --- Phase 4 game math ----------------------------------------------------------------------------
+
+class SeqRng:
+    """random() pops scripted values (then 0.0); randint() returns the lower
+    bound; choice() the first element — for steering lootbox slots."""
+
+    def __init__(self, randoms=()):
+        self.randoms = list(randoms)
+
+    def random(self):
+        return self.randoms.pop(0) if self.randoms else 0.0
+
+    def randint(self, a, b):
+        return a
+
+    def choice(self, seq):
+        return seq[0]
+
+
+def test_player_boosts_compose_and_cap():
+    plain = game.player_boosts("", 0, None)
+    assert plain["coins"] == 1.0 and plain["xp"] == 1.0 and plain["drop"] == 0.0
+    assert game.player_boosts("cinderpup", 0, None)["coins"] == pytest.approx(1.10)
+    assert game.player_boosts("", 2, None)["coins"] == pytest.approx(1.20)
+    assert game.player_boosts("", 99, None)["coins"] == pytest.approx(1.50)  # capped at 5
+    season = game.SEASONS[0]
+    combo = game.player_boosts("cinderpup", 1, season)
+    assert combo["coins"] == pytest.approx(1.10 * 1.10 * 1.25)
+    assert combo["season_mob"] == game.SEASON_MOBS[season["key"]]
+    assert game.player_boosts("pyrelet", 0, None)["arena"] == 10
+    assert game.player_boosts("emberowl", 0, None)["quest"] == pytest.approx(0.25)
+
+
+def test_current_season_windows_and_wrap():
+    def ts(day_of_1970):
+        return day_of_1970 * 86400
+    assert game.current_season(ts(11)) is None                      # Jan 12 — quiet
+    assert game.current_season(ts(95))["key"] == "ashbloom"         # Apr 6
+    assert game.current_season(ts(161))["key"] == "highsun"         # Jun 11
+    assert game.current_season(ts(358))["key"] == "frostflame"      # Dec 25
+    assert game.current_season(ts(366))["key"] == "frostflame"      # Jan 2 — wraps
+    assert game.current_season(ts(369)) is None                     # Jan 5 — over
+
+
+def test_roll_lootbox_slots_and_duplicates():
+    coins = game.roll_lootbox("ember_cache", SeqRng([0.0]), [])
+    assert coins == {"kind": "coins", "amount": 150, "jackpot": False, "duplicate_pet": None}
+    jackpot = game.roll_lootbox("ember_cache", SeqRng([0.995]), [])
+    assert jackpot["jackpot"] is True and jackpot["amount"] == 2000
+    pet = game.roll_lootbox("ember_cache", SeqRng([0.93]), [])
+    assert pet == {"kind": "pet", "item_id": "ashwhisker"}  # first of sorted PET_PERKS
+    dup = game.roll_lootbox("ember_cache", SeqRng([0.93]), ["ashwhisker"])
+    assert dup["kind"] == "coins" and dup["amount"] == game.DUPLICATE_PET_COINS
+    assert dup["duplicate_pet"] == "ashwhisker"
+    for box in game.LOOT_TABLES:
+        assert sum(w for w, _ in game.lootbox_odds(box)) == 100
+
+
+def test_daily_quests_deterministic_and_bounded():
+    first = game.daily_quests("200", "2026-06-12")
+    again = game.daily_quests("200", "2026-06-12")
+    assert first == again and len(first) == game.QUESTS_PER_DAY
+    assert len({q["key"] for q in first}) == game.QUESTS_PER_DAY  # distinct types
+    for quest in first:
+        lo, hi = game.QUEST_TYPES[quest["key"]]["target"]
+        assert lo <= quest["target"] <= hi
+        assert str(quest["target"]) in quest["desc"] or quest["target"] == 1
+    assert game.daily_quests("201", "2026-06-12") != first or \
+           game.daily_quests("200", "2026-06-13") != first  # seeds actually vary
+
+
+def test_quest_reward_scaling():
+    quest = {"reward": 100}
+    assert game.quest_reward(quest, 1) == 110
+    assert game.quest_reward(quest, 10) == 200
+    assert game.quest_reward(quest, 10, {"quest": 0.25}) == 250
+
+
+# --- Phase 4: /equip --------------------------------------------------------------------------------
+
+def test_equip_swaps_owned_gear_freely(world):
+    started(world)
+    set_player(world, coins=1000)
+    handlers.cmd_buy(world.ctx, slash("buy", options=[{"name": "item", "value": "charstick"}]))
+    handlers.cmd_buy(world.ctx, slash("buy", options=[{"name": "item", "value": "cinder saber"}]))
+    set_player(world, sword_enchant=2)
+    assert get_player(world)["sword"] == "cinder_saber"
+    # a deliberate downgrade is allowed — and clears the enchant
+    handlers.cmd_equip(world.ctx, slash("equip", options=[{"name": "item", "value": "charstick"}]))
+    player = get_player(world)
+    assert player["sword"] == "charstick" and player["sword_enchant"] == 0
+    assert "enchantment fades" in text_of(last(world.ctx))
+    # bare fists are always available
+    handlers.cmd_equip(world.ctx, slash("equip", options=[{"name": "item", "value": "fists"}]))
+    assert get_player(world)["sword"] == "fists"
+    # unowned gear is not
+    handlers.cmd_equip(world.ctx, slash("equip", options=[{"name": "item", "value": "dawnforged blade"}]))
+    assert "don't own" in text_of(last(world.ctx))
+    handlers.cmd_equip(world.ctx, slash("equip", options=[{"name": "item", "value": "ember tonic"}]))
+    assert "swords and armor" in text_of(last(world.ctx))
+
+
+# --- Phase 4: pets -----------------------------------------------------------------------------------
+
+def test_pet_set_and_perk_applies(world):
+    started(world)
+    give_items(world, UID, cinderpup=1)
+    handlers.cmd_pet(world.ctx, slash("pet", options=[{"name": "name", "value": "Cinderpup"}]))
+    assert get_player(world)["pet"] == "cinderpup"
+    assert "takes the lead" in text_of(last(world.ctx))
+    handlers.cmd_hunt(world.ctx, slash("hunt"))
+    assert get_player(world)["coins"] == 11  # 10 × 1.10 companion boost
+
+
+def test_pet_board_and_owner_scoped_buttons(world):
+    started(world)
+    handlers.cmd_pet(world.ctx, slash("pet"))
+    assert "hatch from Ember Caches" in text_of(last(world.ctx))
+    give_items(world, UID, cinderpup=1, wisplight=1)
+    handlers.cmd_pet(world.ctx, slash("pet"))
+    buttons = last(world.ctx)["components"][0].to_dict()["components"]
+    assert any(b["custom_id"] == f"{handlers.PET_SET_PREFIX}cinderpup:{UID}" for b in buttons)
+    handlers.comp_pet_set(world.ctx, press(f"{handlers.PET_SET_PREFIX}cinderpup:{UID}", uid="999"))
+    assert "isn't yours" in text_of(last(world.ctx))
+    handlers.comp_pet_set(world.ctx, press(f"{handlers.PET_SET_PREFIX}cinderpup:{UID}"))
+    assert get_player(world)["pet"] == "cinderpup"
+
+
+def test_pet_unowned_cannot_be_set(world):
+    started(world)
+    handlers.cmd_pet(world.ctx, slash("pet", options=[{"name": "name", "value": "Pyrelet"}]))
+    assert "answers your whistle" in text_of(last(world.ctx))
+    assert get_player(world)["pet"] == ""
+
+
+def test_selling_active_pet_clears_leash(world):
+    started(world)
+    give_items(world, UID, cinderpup=1)
+    handlers.cmd_pet(world.ctx, slash("pet", options=[{"name": "name", "value": "cinderpup"}]))
+    handlers.cmd_sell(world.ctx, slash("sell", options=[{"name": "item", "value": "cinderpup"}]))
+    player = get_player(world)
+    assert player["pet"] == "" and player["coins"] == 1000
+    assert "leash hangs empty" in text_of(last(world.ctx))
+
+
+def test_trading_active_pet_suspends_and_restores_on_decline(world):
+    started(world)
+    ready_hero(world, "300")
+    give_items(world, UID, cinderpup=1)
+    handlers.cmd_pet(world.ctx, slash("pet", options=[{"name": "name", "value": "cinderpup"}]))
+    handlers.cmd_trade(world.ctx, slash(
+        "trade", options=[{"name": "user", "value": "300"},
+                          {"name": "item", "value": "cinderpup"},
+                          {"name": "price", "value": 500}], interaction_id="tr-pet"))
+    assert get_player(world)["pet"] == ""  # perk suspended while in escrow
+    handlers.comp_trade_decline(world.ctx, press(f"{handlers.TRADE_DECLINE_PREFIX}tr-pet", uid="300"))
+    assert get_player(world)["pet"] == "cinderpup"  # came home, re-leashed
+    assert item_qty(world, "cinderpup") == 1
+
+
+# --- Phase 4: lootboxes ---------------------------------------------------------------------------------
+
+def test_open_cache_grants_and_chains(world):
+    started(world)
+    give_items(world, UID, ember_cache=2)
+    handlers.cmd_open(world.ctx, slash("open"))
+    assert get_player(world)["coins"] == 150  # ScriptRng: first slot, low roll
+    assert item_qty(world, "ember_cache") == 1
+    response = last(world.ctx)
+    assert response["ephemeral"] is True
+    button = response["components"][0].to_dict()["components"][0]
+    assert button["custom_id"] == f"{handlers.LOOT_AGAIN_PREFIX}ember_cache:{UID}"
+    assert not button.get("disabled")
+    handlers.comp_loot_again(world.ctx, press(f"{handlers.LOOT_AGAIN_PREFIX}ember_cache:{UID}"))
+    assert item_qty(world, "ember_cache") == 0
+    assert get_player(world)["coins"] == 300
+    button = last(world.ctx)["components"][0].to_dict()["components"][0]
+    assert button.get("disabled")
+    assert any(m["metric"] == "caches_opened" for m in world.ctx.metrics.recorded)
+
+
+def test_open_without_cache_shows_odds(world):
+    started(world)
+    handlers.cmd_open(world.ctx, slash("open"))
+    body = text_of(last(world.ctx))
+    assert "what's inside?" in body and "JACKPOT" in body and "%" in body
+    assert "no real-world value" in body
+
+
+def test_open_hatches_pet_and_converts_duplicates(world, monkeypatch):
+    started(world)
+    give_items(world, UID, ember_cache=2)
+    monkeypatch.setattr(handlers, "_rng", SeqRng([0.93, 0.93]))
+    handlers.cmd_open(world.ctx, slash("open"))
+    player = get_player(world)
+    assert item_qty(world, "ashwhisker") == 1
+    assert player["pet"] == "ashwhisker"          # auto-adopted onto the empty leash
+    assert last(world.ctx)["ephemeral"] is False  # a new companion is worth showing off
+    handlers.comp_loot_again(world.ctx, press(f"{handlers.LOOT_AGAIN_PREFIX}ember_cache:{UID}"))
+    assert get_player(world)["coins"] == game.DUPLICATE_PET_COINS
+    assert "already" in text_of(last(world.ctx))
+
+
+def test_open_button_owner_scoped_and_buyable_in_shop(world):
+    started(world)
+    handlers.comp_loot_again(world.ctx, press(f"{handlers.LOOT_AGAIN_PREFIX}ember_cache:{UID}", uid="999"))
+    assert "isn't yours" in text_of(last(world.ctx))
+    set_player(world, coins=500)
+    handlers.cmd_buy(world.ctx, slash("buy", options=[{"name": "item", "value": "ember cache"}]))
+    assert item_qty(world, "ember_cache") == 1
+    handlers.comp_shop_page(world.ctx, press(f"{handlers.SHOP_PAGE_PREFIX}3:{UID}"))
+    assert "Ember Cache" in text_of(last(world.ctx))
+
+
+# --- Phase 4: quests ------------------------------------------------------------------------------------
+
+def quest_keys_for(world, uid=UID):
+    day = game.arena_day(int(world.clock.now()))
+    return [q["key"] for q in game.daily_quests(uid, day)]
+
+
+def test_quest_board_shows_three_and_progress_hooks_fire(world):
+    started(world)
+    handlers.cmd_quests(world.ctx, slash("quests"))
+    body = text_of(last(world.ctx))
+    assert body.count("▫️") + body.count("🎁") + body.count("✅") == game.QUESTS_PER_DAY
+    assert "redraws when the day turns" in body
+    # find a uid whose board includes hunt_win, then verify the hook ticks it
+    uid = next(str(n) for n in range(1000, 1100)
+               if "hunt_win" in [q["key"] for q in game.daily_quests(
+                   str(n), game.arena_day(int(world.clock.now())))])
+    ready_hero(world, uid, level=1)
+    handlers.cmd_hunt(world.ctx, slash("hunt", uid=uid))
+    day = game.arena_day(int(world.clock.now()))
+    idx = [q["key"] for q in game.daily_quests(uid, day)].index("hunt_win")
+    row = world.conn.execute(
+        "SELECT progress FROM quest_progress WHERE user_id = ? AND day = ? AND quest_idx = ?",
+        [uid, day, idx]).fetchone()
+    assert row[0] == 1
+
+
+def test_quest_claim_pays_once_and_is_owner_scoped(world):
+    started(world)
+    day = game.arena_day(int(world.clock.now()))
+    quests = game.daily_quests(UID, day)
+    target_idx = 0
+    quest = quests[target_idx]
+    for _ in range(quest["target"]):
+        handlers._quest_event(world.ctx, UID, quest["key"], int(world.clock.now()))
+    handlers.cmd_quests(world.ctx, slash("quests"))
+    buttons = last(world.ctx)["components"][0].to_dict()["components"]
+    claim_id = f"{handlers.QUEST_CLAIM_PREFIX}{target_idx}:{UID}"
+    assert any(b["custom_id"] == claim_id for b in buttons)
+
+    handlers.comp_quest_claim(world.ctx, press(claim_id, uid="999"))
+    assert "isn't yours" in text_of(last(world.ctx))
+    handlers.comp_quest_claim(world.ctx, press(claim_id))
+    expected = game.quest_reward(quest, 1)
+    player = get_player(world)
+    assert player["coins"] == expected and player["xp"] == game.QUEST_XP
+    handlers.comp_quest_claim(world.ctx, press(claim_id))  # double-claim
+    assert "already claimed" in text_of(last(world.ctx))
+    assert get_player(world)["coins"] == expected
+
+
+def test_quest_claim_rejects_incomplete_and_prunes_old(world):
+    started(world)
+    handlers.comp_quest_claim(world.ctx, press(f"{handlers.QUEST_CLAIM_PREFIX}0:{UID}"))
+    assert "Not finished yet" in text_of(last(world.ctx))
+    old_day = game.arena_day(int(world.clock.now()) - 10 * 86400)
+    world.conn.execute(
+        "INSERT INTO quest_progress (user_id, day, quest_idx, progress, claimed) "
+        "VALUES (?, ?, 0, 5, 1)", [UID, old_day])
+    world.conn.commit()
+    handlers.cmd_quests(world.ctx, slash("quests"))
+    assert world.conn.execute("SELECT COUNT(*) FROM quest_progress WHERE day = ?",
+                              [old_day]).fetchone()[0] == 0
+
+
+# --- Phase 4: rekindling ----------------------------------------------------------------------------------
+
+def test_rekindle_gate_below_twenty(world):
+    started(world)
+    handlers.cmd_rekindle(world.ctx, slash("rekindle"))
+    assert "level **20+**" in text_of(last(world.ctx))
+    assert get_player(world)["rekindles"] == 0
+
+
+def test_rekindle_confirm_resets_and_rewards(world):
+    started(world)
+    set_player(world, level=22, xp=game.xp_for_level(22) + 5, coins=9999,
+               sword="ironspark_blade", sword_enchant=3, max_hp=310, hp=200,
+               last_daily_at=777)
+    give_items(world, UID, ember_shard=10, cinderpup=1, ember_cache=2)
+    handlers.cmd_pet(world.ctx, slash("pet", options=[{"name": "name", "value": "cinderpup"}]))
+
+    handlers.cmd_rekindle(world.ctx, slash("rekindle"))
+    warning = last(world.ctx)
+    assert "cannot be undone" in text_of(warning)
+    assert "stays at your side" in text_of(warning)
+    confirm_id = warning["components"][0].to_dict()["components"][0]["custom_id"]
+    assert confirm_id == f"{handlers.REKINDLE_CONFIRM_PREFIX}{UID}"
+
+    handlers.comp_rekindle_confirm(world.ctx, press(confirm_id, uid="999"))
+    assert "isn't yours" in text_of(last(world.ctx))
+    handlers.comp_rekindle_confirm(world.ctx, press(confirm_id))
+    player = get_player(world)
+    assert player["level"] == 1 and player["xp"] == 0 and player["coins"] == 0
+    assert player["sword"] == "fists" and player["sword_enchant"] == 0
+    assert player["max_hp"] == 100 and player["hp"] == 100
+    assert player["rekindles"] == 1
+    assert player["last_daily_at"] == 777          # no bonus daily from resetting
+    assert player["pet"] == "cinderpup"            # companion stays
+    assert item_qty(world, "cinderpup") == 1
+    assert item_qty(world, "ember_shard") == 0     # everything else burns
+    assert item_qty(world, "ember_cache") == 0
+    assert "rekindles their flame! (×1)" in text_of(last(world.ctx))
+
+    # a stale second press finds a level-1 hero and refuses
+    handlers.comp_rekindle_confirm(world.ctx, press(confirm_id))
+    assert "isn't ready" in text_of(last(world.ctx))
+    assert get_player(world)["rekindles"] == 1
+
+    # the permanent bonus actually pays: daily is boosted by 10%
+    handlers.cmd_daily(world.ctx, slash("daily"))
+    expected = max(1, round(game.daily_reward(1, 1.0)["coins"]
+                            * game.player_boosts("cinderpup", 1, None)["coins"]))
+    assert get_player(world)["coins"] == expected
+    handlers.cmd_profile(world.ctx, slash("profile"))
+    assert "🔥×1" in text_of(last(world.ctx))
+
+
+def test_rekindle_burns_open_escrows_too(world):
+    # An open challenge's stake must not resurrect post-burn via a late decline.
+    started(world)
+    ready_hero(world, "300")
+    set_player(world, UID, level=22, coins=500)
+    handlers.cmd_duel(world.ctx, slash(
+        "duel", options=[{"name": "user", "value": "300"}, {"name": "bet", "value": 200}],
+        interaction_id="rk-duel"))
+    give_items(world, UID, ember_tonic=2)
+    assert get_player(world)["coins"] == 300  # 200 escrowed
+
+    handlers.cmd_rekindle(world.ctx, slash("rekindle"))
+    handlers.comp_rekindle_confirm(world.ctx, press(f"{handlers.REKINDLE_CONFIRM_PREFIX}{UID}"))
+    player = get_player(world)
+    assert player["rekindles"] == 1 and player["coins"] == 0
+    duel_status = world.conn.execute("SELECT status FROM duels WHERE id = 'rk-duel'").fetchone()
+    assert duel_status[0] == "expired"  # withdrawn before the burn
+
+    # a late decline press cannot refund anything anymore
+    handlers.comp_duel_decline(world.ctx, press(f"{handlers.DUEL_DECLINE_PREFIX}rk-duel", uid="300"))
+    assert get_player(world)["coins"] == 0
+
+
+# --- Phase 4: seasons ----------------------------------------------------------------------------------------
+
+def test_seasonal_boost_and_creature_in_hunts(world):
+    # march the world clock to April 6 — deep in the Ashbloom
+    now = int(world.clock.now())
+    world.clock.advance(95 * 86400 - now)
+    started(world)
+    handlers.cmd_hunt(world.ctx, slash("hunt"))
+    body = text_of(last(world.ctx))
+    # ScriptRng(0.0): the season roll converts the encounter to the bonus creature
+    assert "Bloomwisp" in body and "creature of the season" in body
+    expected = max(1, round(10 * 1.25 * game.SEASON_MOB_BONUS))
+    assert get_player(world)["coins"] == expected
+    handlers.cmd_quests(world.ctx, slash("quests"))
+    assert "Ashbloom" in text_of(last(world.ctx))
+    handlers.cmd_profile(world.ctx, slash("profile"))
+    assert "burns" in text_of(last(world.ctx))
+
+
+def test_epoch_guard_buries_stale_settlements(world):
+    # THE prestige-farming blocker: a settle computed from a pre-Rekindle read
+    # must not resurrect the old character via the level/max_hp ratchet.
+    started(world)
+    set_player(world, level=22, xp=game.xp_for_level(22), coins=500)
+    stale = get_player(world)  # what a concurrent handler would have read
+    handlers.cmd_rekindle(world.ctx, slash("rekindle"))
+    handlers.comp_rekindle_confirm(world.ctx, press(f"{handlers.REKINDLE_CONFIRM_PREFIX}{UID}"))
+    assert get_player(world)["level"] == 1 and get_player(world)["rekindles"] == 1
+
+    handlers._settle_social(world.ctx, stale, 500, 1000, int(world.clock.now()))
+    player = get_player(world)
+    assert player["level"] == 1 and player["xp"] == 0 and player["coins"] == 0
+    assert player["max_hp"] == 100  # the ratchet did NOT resurrect level 22
+
+    # stale grants and credits burn the same way
+    assert handlers._add_item(world.ctx, UID, "ember_shard", epoch=0) is False
+    assert item_qty(world, "ember_shard") == 0
+    world.ctx.sql.execute(handlers._CREDIT_COINS_EPOCH, ["Tess", 999, UID, 0])
+    assert get_player(world)["coins"] == 0
+
+    # while CURRENT-epoch play works normally
+    fresh = get_player(world)
+    handlers._settle_social(world.ctx, fresh, 30, 0, None)
+    assert get_player(world)["xp"] == 30
+
+
+def test_duel_accept_refuses_cross_epoch_challenge(world):
+    # A challenge staked before a Rekindling must dissolve at accept time —
+    # its escrow can never ferry value across the burn to either fighter.
+    started(world)
+    ready_hero(world, "300")
+    set_player(world, "300", coins=500)
+    world.conn.execute(
+        "INSERT INTO duels (id, challenger_id, target_id, challenger_name, bet, "
+        "status, created_at, epoch) VALUES ('xe-d', ?, '300', 'Tess', 100, "
+        "'open', ?, 0)", [UID, int(world.clock.now())])
+    world.conn.commit()
+    set_player(world, rekindles=1)  # challenger has since been reborn
+    handlers.comp_duel_accept(world.ctx, press(f"{handlers.DUEL_ACCEPT_PREFIX}xe-d", uid="300"))
+    assert "burned out" in text_of(last(world.ctx))
+    assert get_player(world)["coins"] == 0          # stake stayed burned
+    assert get_player(world, "300")["coins"] == 500  # target never debited
+    row = world.conn.execute("SELECT status FROM duels WHERE id = 'xe-d'").fetchone()
+    assert row[0] == "expired"
+
+
+def test_trade_accept_refuses_cross_epoch_offer(world):
+    started(world)
+    ready_hero(world, "300")
+    set_player(world, "300", coins=500)
+    world.conn.execute(
+        "INSERT INTO trades (id, seller_id, buyer_id, seller_name, item_id, qty, "
+        "price, status, created_at, epoch) VALUES ('xe-t', ?, '300', 'Tess', "
+        "'ember_tonic', 2, 100, 'open', ?, 0)", [UID, int(world.clock.now())])
+    world.conn.commit()
+    set_player(world, rekindles=1)  # seller has since been reborn
+    handlers.comp_trade_accept(world.ctx, press(f"{handlers.TRADE_ACCEPT_PREFIX}xe-t", uid="300"))
+    assert "burned out" in text_of(last(world.ctx))
+    assert get_player(world, "300")["coins"] == 500            # buyer untouched
+    assert item_qty(world, game.LIFE_POTION, "300") == 0       # no goods moved
+    assert item_qty(world, game.LIFE_POTION) == 0              # escrow burned
+    row = world.conn.execute("SELECT status FROM trades WHERE id = 'xe-t'").fetchone()
+    assert row[0] == "expired"
+
+
+def test_escrow_opened_against_stale_epoch_is_refused(world):
+    # A challenge row carrying a pre-burn epoch must refuse refunds post-burn.
+    started(world)
+    ready_hero(world, "300")
+    world.conn.execute(
+        "INSERT INTO duels (id, challenger_id, target_id, challenger_name, bet, "
+        "status, created_at, epoch) VALUES ('stale-d', ?, '300', 'Tess', 250, "
+        "'open', ?, 0)", [UID, int(world.clock.now())])
+    world.conn.commit()
+    set_player(world, rekindles=1)  # the character has since been reborn
+    handlers.comp_duel_decline(world.ctx, press(f"{handlers.DUEL_DECLINE_PREFIX}stale-d", uid="300"))
+    assert get_player(world)["coins"] == 0  # the 250-Ember stake stayed burned
+
+
+def test_no_season_no_banner(world):
+    started(world)  # fixture sits on Jan 12 — outside every window
+    handlers.cmd_hunt(world.ctx, slash("hunt"))
+    assert "creature of the season" not in text_of(last(world.ctx))
+    assert get_player(world)["coins"] == 10
+
+
 # --- Meta: manifest, registration, capabilities, packaging traps -------------------------------------
 
 def test_manifest_matches_handlers_and_dashboard():
@@ -1857,7 +2320,8 @@ def test_slash_dispatch_through_registered_filters(world):
                    "trade": [{"name": "user", "value": "42424242"},
                              {"name": "item", "value": "charstick"},
                              {"name": "price", "value": 10}],
-                   "guild": [{"name": "action", "value": "info"}]}.get(command)
+                   "guild": [{"name": "action", "value": "info"}],
+                   "equip": [{"name": "item", "value": "ironspark blade"}]}.get(command)
         event = slash(command, options=options)
         for wrapped in registry:
             wrapped(ctx, event)
@@ -1916,7 +2380,11 @@ def test_custom_ids_fit_discord_limit():
                 f"{handlers.TRADE_ACCEPT_PREFIX}{snowflake}",
                 f"{handlers.TRADE_DECLINE_PREFIX}{snowflake}",
                 f"{handlers.TRADE_CANCEL_PREFIX}{snowflake}",
-                f"{handlers.ARENA_JOIN_PREFIX}2026-06-11"):
+                f"{handlers.ARENA_JOIN_PREFIX}2026-06-11",
+                f"{handlers.QUEST_CLAIM_PREFIX}2:{snowflake}",
+                f"{handlers.REKINDLE_CONFIRM_PREFIX}{snowflake}",
+                f"{handlers.LOOT_AGAIN_PREFIX}blazing_cache:{snowflake}",
+                f"{handlers.PET_SET_PREFIX}ashwhisker:{snowflake}"):
         assert len(cid) <= 100
 
 

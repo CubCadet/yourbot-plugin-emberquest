@@ -50,6 +50,15 @@
           "label": "Duels fought (30d)"
         },
         {
+          "id": "stat_caches_opened",
+          "type": "stat_card",
+          "title": "Caches opened (30d)",
+          "width": "third",
+          "refresh_seconds": 300,
+          "rpc_method": "get_caches_opened",
+          "label": "Caches opened (30d)"
+        },
+        {
           "id": "chart_commands_7d",
           "type": "chart",
           "title": "Commands \u2014 7 days",
