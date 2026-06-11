@@ -1029,15 +1029,104 @@ def test_dungeon_open_race_converges_on_one_lobby(world):
     assert "1/4" in text_of(last(racer))  # loser was shown the winner's lobby
 
 
-def test_one_open_lobby_enforced_by_unique_index(world):
-    # A truly concurrent open bypasses WHERE NOT EXISTS — the partial unique
-    # index must reject the second 'open' row at the database layer.
+def test_one_open_lobby_enforced_by_lock_claim(world):
+    # The host forbids CREATE UNIQUE INDEX, so the one-lobby invariant rides
+    # the locks table: while a lobby is open its lock is held, and a truly
+    # concurrent open (fresh ephemeral, stale read) loses the atomic claim.
     open_lobby(world)
-    with pytest.raises(RuntimeError):
-        world.ctx.sql.execute(
-            "INSERT INTO dungeons (id, dungeon_key, channel_id, leader_id, status, "
-            "created_at, member_count) VALUES (%s, %s, %s, %s, 'open', %s, 1)",
-            ["d-race", "kiln", "1", "300", int(world.clock.now())])
+    lock = world.conn.execute("SELECT ref FROM locks WHERE name = 'dungeon'").fetchone()
+    assert lock[0] == "d1"
+    racer = world.make_ctx()
+    assert handlers._acquire_lock(racer, "dungeon", "dungeon", "d-race",
+                                  int(world.clock.now())) is False
+    assert world.conn.execute("SELECT COUNT(*) FROM dungeons").fetchone()[0] == 1
+
+
+def test_lock_birth_grace_protects_mid_open_claims(world):
+    # An open claims its lock one roundtrip before inserting the row: a young
+    # lock with no holder row must NOT be breakable (TOCTOU), only an old one.
+    now = int(world.clock.now())
+    assert handlers._acquire_lock(world.ctx, "duel", "duel:200", "fresh-ref", now)
+    # holder row doesn't exist yet — a racer must lose the claim
+    racer = world.make_ctx()
+    assert handlers._acquire_lock(racer, "duel", "duel:200", "thief-ref", now) is False
+    lock = world.conn.execute("SELECT ref FROM locks WHERE name = 'duel:200'").fetchone()
+    assert lock[0] == "fresh-ref"
+    # but an orphaned claim (no row ever landed) is breakable after the grace
+    world.clock.advance(handlers._LOCK_BIRTH_GRACE + 1)
+    assert handlers._acquire_lock(racer, "duel", "duel:200", "heir-ref",
+                                  int(world.clock.now())) is True
+
+
+def test_stuck_resolving_rows_are_recovered_by_sweeps(world):
+    started(world)
+    ready_hero(world, "300")
+    old = int(world.clock.now()) - game.TRADE_TTL - 700
+    world.conn.execute(
+        "INSERT INTO duels (id, challenger_id, target_id, challenger_name, bet, "
+        "status, created_at, epoch) VALUES ('wedged-d', ?, '300', 'Tess', 80, "
+        "'resolving', ?, 0)", [UID, old])
+    world.conn.execute(
+        "INSERT INTO trades (id, seller_id, buyer_id, seller_name, item_id, qty, "
+        "price, status, created_at, epoch) VALUES ('wedged-t', ?, '300', 'Tess', "
+        "'ember_tonic', 2, 50, 'resolving', ?, 0)", [UID, old])
+    world.conn.commit()
+    handlers._sweep_stale_duels(world.ctx, int(world.clock.now()))
+    handlers._sweep_stale_trades(world.ctx, int(world.clock.now()))
+    assert world.conn.execute(
+        "SELECT status FROM duels WHERE id = 'wedged-d'").fetchone()[0] == "expired"
+    assert world.conn.execute(
+        "SELECT status FROM trades WHERE id = 'wedged-t'").fetchone()[0] == "expired"
+    assert get_player(world)["coins"] == 80           # escrowed stake came home
+    assert item_qty(world, game.LIFE_POTION) == 2     # escrowed goods came home
+
+
+def test_wedged_resolving_lobby_is_recovered(world):
+    open_lobby(world)
+    world.conn.execute("UPDATE dungeons SET status = 'resolving' WHERE id = 'd1'")
+    world.conn.commit()
+    world.clock.advance(game.DUNGEON_LOBBY_TTL + 700)
+    ready_hero(world, "300")
+    handlers.cmd_dungeon(world.ctx, slash("dungeon", uid="300", interaction_id="d2"))
+    assert lobby_row(world)["status"] == "expired"
+    assert get_player(world, UID)["last_dungeon_at"] == 0  # 2h claim refunded
+    assert lobby_row(world, "d2") is not None              # server unblocked
+
+
+def test_failed_defer_leaves_lobby_open(world, monkeypatch):
+    open_lobby(world)
+    ready_hero(world, "300")
+    handlers.comp_dungeon_join(world.ctx, press(f"{handlers.DUNGEON_JOIN_PREFIX}d1", uid="300"))
+
+    from yourbot_sdk import SdkError
+
+    def explode(*args, **kwargs):
+        raise SdkError("rate limited")
+
+    monkeypatch.setattr(world.ctx.interaction, "defer", explode, raising=False)
+    handlers.comp_dungeon_begin(world.ctx, press(f"{handlers.DUNGEON_BEGIN_PREFIX}d1", uid=UID))
+    # the defer failed BEFORE the resolution claim: nothing is wedged
+    assert lobby_row(world)["status"] == "open"
+
+
+def test_locks_self_heal_when_holder_is_finished(world):
+    # A lock orphaned by a crash (holder row terminal) is broken and re-claimed.
+    open_lobby(world)
+    world.conn.execute("UPDATE dungeons SET status = 'resolved' WHERE id = 'd1'")
+    world.conn.commit()
+    assert handlers._acquire_lock(world.ctx, "dungeon", "dungeon", "d2",
+                                  int(world.clock.now())) is True
+    lock = world.conn.execute("SELECT ref FROM locks WHERE name = 'dungeon'").fetchone()
+    assert lock[0] == "d2"
+
+
+def test_lock_released_at_every_lobby_terminal(world):
+    open_lobby(world)
+    world.clock.advance(game.DUNGEON_LOBBY_TTL + 1)
+    handlers.cmd_dungeon(world.ctx, slash("dungeon", interaction_id="probe"))
+    # the stale lobby expired lazily -> its lock must be gone or re-owned
+    lock = world.conn.execute("SELECT ref FROM locks WHERE name = 'dungeon'").fetchone()
+    assert lock is None or lock[0] != "d1"
 
 
 def test_dungeon_cooldown_claimed_at_join_and_refunded_on_expiry(world):
@@ -2386,6 +2475,50 @@ def test_custom_ids_fit_discord_limit():
                 f"{handlers.LOOT_AGAIN_PREFIX}blazing_cache:{snowflake}",
                 f"{handlers.PET_SET_PREFIX}ashwhisker:{snowflake}"):
         assert len(cid) <= 100
+
+
+_HOST_ALLOWED_SQL = ("ALTER TABLE", "CREATE INDEX", "CREATE TABLE", "DELETE",
+                     "DROP INDEX", "DROP TABLE", "INSERT", "SELECT", "UPDATE")
+
+
+def test_all_sql_statement_types_pass_host_allowlist():
+    # The live host rejects any statement type outside its allowlist (e.g.
+    # CREATE UNIQUE INDEX) — scan every string literal that looks like SQL.
+    import ast
+    source = (ROOT / "handlers.py").read_text()
+    sql_starters = ("SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ", "ALTER ",
+                    "DROP ", "WITH ", "TRUNCATE ", "REPLACE ", "EXPLAIN ", "VACUUM ",
+                    "GRANT ", "BEGIN ", "MERGE ")
+    checked = 0
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            text = node.value.strip()
+            # case-sensitive + trailing space: real SQL constants are
+            # uppercase keywords, unlike dict keys such as "drop".
+            if text.startswith(sql_starters):
+                assert text.startswith(_HOST_ALLOWED_SQL), text[:60]
+                checked += 1
+    assert checked > 40  # sanity: the scan actually saw the statement constants
+
+
+def test_options_accept_live_gateway_alias(world):
+    # The live gateway carries both `options` and the legacy `command_options`;
+    # if `options` ever drops, arguments must still parse from the alias.
+    started(world)
+    set_player(world, coins=100)
+    event = make_event("interaction_create", command_name="coinflip", user_id=UID,
+                       channel_id="1", user_username="cubcadetxt1",
+                       command_options=[{"name": "bet", "type": 4, "value": 10}])
+    handlers.cmd_coinflip(world.ctx, event)
+    assert get_player(world)["coins"] == 110  # bet parsed, ScriptRng(0.0) wins
+
+
+def test_username_accepts_live_gateway_field(world):
+    # Production sends user_username (not the documented user_name).
+    event = make_event("interaction_create", command_name="start", user_id="808",
+                       channel_id="1", user_username="livename")
+    handlers.cmd_start(world.ctx, event)
+    assert get_player(world, "808")["username"] == "livename"
 
 
 def test_no_message_content_token_in_shipped_source():

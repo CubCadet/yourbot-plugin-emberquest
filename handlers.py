@@ -107,10 +107,10 @@ _SCHEMA = (
     "  status       TEXT NOT NULL DEFAULT 'open',"
     "  created_at   BIGINT NOT NULL,"
     "  member_count INT NOT NULL DEFAULT 0)",
-    # Hard one-open-lobby invariant: concurrent opens collide on this index
-    # (WHERE NOT EXISTS alone is not atomic across statements).
-    "CREATE UNIQUE INDEX IF NOT EXISTS dungeons_one_open ON dungeons (status) "
-    "WHERE status = 'open'",
+    # NOTE: the host only allows these statement types: ALTER TABLE,
+    # CREATE INDEX, CREATE TABLE, DELETE, DROP INDEX, DROP TABLE, INSERT,
+    # SELECT, UPDATE. CREATE UNIQUE INDEX is NOT among them (verified live),
+    # so one-open invariants live in the `locks` table below instead.
     "CREATE TABLE IF NOT EXISTS dungeon_members ("
     "  dungeon_id TEXT NOT NULL,"
     "  user_id    TEXT NOT NULL,"
@@ -128,11 +128,6 @@ _SCHEMA = (
     "  channel_id      TEXT NOT NULL DEFAULT '',"
     "  created_at      BIGINT NOT NULL,"
     "  epoch           INT NOT NULL DEFAULT 0)",
-    # One live challenge per challenger — the predicate includes 'resolving' so
-    # a second challenge can never slip in mid-settlement (which would make the
-    # resolving→open REOPEN collide with this very index).
-    "CREATE UNIQUE INDEX IF NOT EXISTS duels_one_live_per_challenger "
-    "ON duels (challenger_id) WHERE status IN ('open', 'resolving')",
     "CREATE TABLE IF NOT EXISTS trades ("
     "  id          TEXT PRIMARY KEY,"
     "  seller_id   TEXT NOT NULL,"
@@ -145,8 +140,6 @@ _SCHEMA = (
     "  channel_id  TEXT NOT NULL DEFAULT '',"
     "  created_at  BIGINT NOT NULL,"
     "  epoch       INT NOT NULL DEFAULT 0)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS trades_one_live_per_seller "
-    "ON trades (seller_id) WHERE status IN ('open', 'resolving')",
     "CREATE TABLE IF NOT EXISTS guilds ("
     "  key          TEXT PRIMARY KEY,"
     "  name         TEXT NOT NULL,"
@@ -181,6 +174,15 @@ _SCHEMA = (
     "  progress  INT NOT NULL DEFAULT 0,"
     "  claimed   INT NOT NULL DEFAULT 0,"
     "  PRIMARY KEY (user_id, day, quest_idx))",
+    # One-open invariants (one dungeon lobby per server, one live challenge
+    # per challenger, one live offer per seller) ride this table's PRIMARY
+    # KEY: an INSERT ... ON CONFLICT DO NOTHING is an atomic insert-once
+    # claim, judged by rowcount — the allowlist-legal replacement for the
+    # partial unique indexes the host refuses.
+    "CREATE TABLE IF NOT EXISTS locks ("
+    "  name       TEXT PRIMARY KEY,"
+    "  ref        TEXT NOT NULL,"
+    "  created_at BIGINT NOT NULL DEFAULT 0)",
 )
 
 # Upgrades for servers that installed the Phase-1 schema. New installs get the
@@ -198,15 +200,15 @@ _MIGRATIONS = (
 
 
 def _ensure_schema(ctx):
-    for ddl in _SCHEMA:
-        ctx.sql.execute(ddl)
-    for migration in _MIGRATIONS:
+    # EVERY statement is individually walled: one host rejection must never
+    # block the tables after it (a single failure once left half the schema
+    # uncreated in production).
+    for ddl in _SCHEMA + _MIGRATIONS:
         try:
-            ctx.sql.execute(migration)
+            ctx.sql.execute(ddl)
         except (SdkError, RuntimeError) as exc:
-            # A host that already applied the column (or rejects the IF NOT
-            # EXISTS form) must not take the whole plugin down with it.
-            ctx.log("EmberQuest migration skipped: " + str(exc), level="warning")
+            ctx.log("EmberQuest schema statement skipped: " + str(exc),
+                    level="warning")
 
 
 @plugin.on_install
@@ -303,10 +305,12 @@ _ENCHANT_SET = {
 
 _EXPIRE_ONE_LOBBY = ("UPDATE dungeons SET status = 'expired' "
                      "WHERE id = %s AND status = 'open'")
+_EXPIRE_RESOLVING_LOBBY = ("UPDATE dungeons SET status = 'expired' "
+                           "WHERE id = %s AND status = 'resolving'")
 
-# Sequential opens converge via WHERE NOT EXISTS; truly concurrent opens
-# collide on the dungeons_one_open unique index, and the loser catches the
-# host error and shows the winner's lobby instead.
+# Sequential opens converge via WHERE NOT EXISTS; truly concurrent opens are
+# serialized by the 'dungeon' lock claim (the host's allowlist forbids the
+# unique index that once backstopped this).
 _OPEN_DUNGEON = (
     "INSERT INTO dungeons (id, dungeon_key, channel_id, leader_id, status, created_at, "
     "member_count) "
@@ -333,6 +337,66 @@ _CLAIM_RESOLUTION = ("UPDATE dungeons SET status = 'resolving' "
                      "WHERE id = %s AND status = 'open'")
 _FINISH_DUNGEON = "UPDATE dungeons SET status = 'resolved' WHERE id = %s"
 
+# --- Lock statements (one-open invariants, host-allowlist legal) -----------------
+
+_LOCK_CLAIM = ("INSERT INTO locks (name, ref, created_at) VALUES (%s, %s, %s) "
+               "ON CONFLICT (name) DO NOTHING")
+_LOCK_READ = "SELECT ref, created_at FROM locks WHERE name = %s"
+# Release is CAS'd on the ref so a later holder is never evicted by accident.
+_LOCK_RELEASE = "DELETE FROM locks WHERE name = %s AND ref = %s"
+
+# Status lookups for self-healing stale locks (one literal per domain — SQL is
+# never assembled from variables).
+_LOCK_HOLDER_STATUS = {
+    "dungeon": "SELECT status FROM dungeons WHERE id = %s",
+    "duel": "SELECT status FROM duels WHERE id = %s",
+    "trade": "SELECT status FROM trades WHERE id = %s",
+}
+# Ambiguous-failure re-reads check OWNERSHIP too: an id collision must never
+# report someone else's live row as your own successful open.
+_DUEL_OWNER = "SELECT challenger_id FROM duels WHERE id = %s"
+_TRADE_OWNER = "SELECT seller_id FROM trades WHERE id = %s"
+# A lock is stale once its holder is terminal/missing, or after the domain's
+# TTL plus a grace period (covers a handler that died before releasing).
+_LOCK_MAX_AGE = {
+    "dungeon": game.DUNGEON_LOBBY_TTL + 600,
+    "duel": game.DUEL_TTL + 600,
+    "trade": game.TRADE_TTL + 600,
+}
+
+
+_LOCK_BIRTH_GRACE = 60  # every open claims the lock one roundtrip BEFORE
+                        # inserting its row — a young lock with no holder row
+                        # is mid-birth, NOT stale (breaking it would let two
+                        # concurrent opens both succeed)
+
+
+def _acquire_lock(ctx, kind, name, ref, now) -> bool:
+    """Atomic insert-once claim with self-healing: a lock whose holder is
+    finished (or long overdue) is broken and re-claimed in one pass."""
+    for _ in range(2):
+        if ctx.sql.execute(_LOCK_CLAIM, [name, ref, now]):
+            return True
+        lock = ctx.sql.query_one(_LOCK_READ, [name])
+        if lock is None:
+            continue  # released between our claim and read — try again
+        holder = ctx.sql.query_one(_LOCK_HOLDER_STATUS[kind], [lock["ref"]])
+        age = now - int(lock["created_at"])
+        if holder is None:
+            stale = age > _LOCK_BIRTH_GRACE  # row mid-insert vs orphaned claim
+        else:
+            stale = (holder["status"] not in ("open", "resolving")
+                     or age > _LOCK_MAX_AGE[kind])
+        if not stale:
+            return False  # genuinely held
+        ctx.sql.execute(_LOCK_RELEASE, [name, lock["ref"]])  # stale: break it
+    return ctx.sql.execute(_LOCK_CLAIM, [name, ref, now]) > 0
+
+
+def _release_lock(ctx, name, ref):
+    _quietly(ctx.sql.execute, _LOCK_RELEASE, [name, ref])
+
+
 # --- Duel statements (Phase 3) ---------------------------------------------------
 
 # The duels_one_live_per_challenger index rejects a second concurrent open;
@@ -351,6 +415,11 @@ _DUEL_EXPIRE_CAS = "UPDATE duels SET status = 'expired' WHERE id = %s AND status
 _DUEL_VOID_RESOLVING = "UPDATE duels SET status = 'expired' WHERE id = %s AND status = 'resolving'"
 _DUEL_FINISH = "UPDATE duels SET status = 'resolved' WHERE id = %s"
 _REFUND_DUEL_COOLDOWN = "UPDATE players SET last_duel_at = 0 WHERE user_id = %s"
+_STUCK_RESOLVING_DUELS = ("SELECT * FROM duels WHERE status = 'resolving' "
+                          "AND created_at < %s")
+_STUCK_RESOLVING_TRADES = ("SELECT * FROM trades WHERE status = 'resolving' "
+                           "AND created_at < %s")
+_PRUNE_LOCKS = "DELETE FROM locks WHERE created_at < %s"
 # Terminal rows have no escrow; prune them after a week so tables stay bounded.
 _PRUNE_DUELS = ("DELETE FROM duels WHERE status NOT IN ('open', 'resolving') "
                 "AND created_at < %s")
@@ -491,11 +560,20 @@ _INVENTORY_TAKE = ("UPDATE inventory SET qty = qty - 1 "
 # --- Shared helpers ----------------------------------------------------------
 
 def _options(event) -> dict:
-    return {o.get("name"): o.get("value") for o in event.get("options") or []}
+    # The live gateway sends both `options` and the deprecated alias
+    # `command_options` today; accept either (and either shape) so a gateway
+    # field drift can't silently strip every command's arguments — the same
+    # class of breakage user_name/user_username caused for usernames.
+    raw = event.get("options") or event.get("command_options") or []
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {o.get("name"): o.get("value") for o in raw}
 
 
 def _username(event) -> str:
-    return str(event.get("user_name") or "")
+    # The SDK's typed schema documents `user_name`, but the LIVE gateway sends
+    # `user_username` (verified in production logs) — accept both.
+    return str(event.get("user_name") or event.get("user_username") or "")
 
 
 def _embed(title, description="", fields=None, footer=None) -> dict:
@@ -1346,11 +1424,18 @@ def _lobby_expired(lobby, now) -> bool:
     return now - int(lobby["created_at"]) >= game.DUNGEON_LOBBY_TTL
 
 
+def _dungeon_terminal(ctx, lobby_id, statement) -> bool:
+    if ctx.sql.execute(statement, [lobby_id]):
+        _release_lock(ctx, "dungeon", lobby_id)
+        return True
+    return False
+
+
 def _close_lobby_if_stale(ctx, lobby, now) -> bool:
     """Lazily expire a TTL-passed lobby; True if it was (or just went) stale."""
     if lobby["status"] != "open" or not _lobby_expired(lobby, now):
         return lobby["status"] == "expired"
-    if ctx.sql.execute(_EXPIRE_ONE_LOBBY, [lobby["id"]]):
+    if _dungeon_terminal(ctx, lobby["id"], _EXPIRE_ONE_LOBBY):
         _refund_lobby_cooldowns(ctx, lobby["id"])
     return True
 
@@ -1363,6 +1448,13 @@ def _expire_stale_lobbies(ctx, now):
     )
     for lobby in stale:
         _close_lobby_if_stale(ctx, lobby, now)
+    # A lobby wedged in 'resolving' (worker died mid-battle) gets closed and
+    # its members' 2h claims refunded once it's long past any real fight.
+    for lobby in ctx.sql.query(
+            "SELECT id FROM dungeons WHERE status = 'resolving' AND created_at < %s",
+            [now - game.DUNGEON_LOBBY_TTL - 600], limit=10):
+        if _dungeon_terminal(ctx, lobby["id"], _EXPIRE_RESOLVING_LOBBY):
+            _quietly(_refund_lobby_cooldowns, ctx, lobby["id"])
 
 
 def _claim_player_dungeon_cooldown(ctx, user_id, now) -> bool:
@@ -1448,14 +1540,26 @@ def cmd_dungeon(ctx, event):
         return
     ctx.ephemeral.cooldown_set("dungeon:open", ttl_seconds=5)
 
-    dungeon_id = str(event.get("interaction_id") or now)
+    dungeon_id = str(event.get("interaction_id") or "")
+    if not dungeon_id:
+        dungeon_id = player["user_id"] + "-" + str(now)  # collision-proof fallback
     channel_id = str(event.get("channel_id") or "")
+    # One lobby per server: an atomic lock claim (allowlist-legal stand-in for
+    # the partial unique index the host refuses).
+    if not _acquire_lock(ctx, "dungeon", "dungeon", dungeon_id, now):
+        lobby = _open_lobby(ctx)
+        if lobby is not None:
+            _lobby_response(ctx, lobby, _lobby_members(ctx, lobby["id"]), now)
+        else:
+            _try_respond(ctx, "The lobby flickered out — try **/dungeon** again.")
+        return
     try:
         opened = ctx.sql.execute(
             _OPEN_DUNGEON, [dungeon_id, dungeon_key, channel_id, player["user_id"], now])
     except (SdkError, RuntimeError):
-        opened = 0  # collided with a concurrent open on the unique index
+        opened = 0
     if not opened:  # lost the race — show whoever won
+        _release_lock(ctx, "dungeon", dungeon_id)
         lobby = _open_lobby(ctx)
         if lobby is not None:
             _lobby_response(ctx, lobby, _lobby_members(ctx, lobby["id"]), now)
@@ -1465,7 +1569,7 @@ def cmd_dungeon(ctx, event):
     # The leader's 2h claim lands after the lobby exists; if it fails (another
     # expedition resolved for them this very instant), take the lobby down.
     if not _claim_player_dungeon_cooldown(ctx, player["user_id"], now):
-        ctx.sql.execute(_EXPIRE_ONE_LOBBY, [dungeon_id])
+        _dungeon_terminal(ctx, dungeon_id, _EXPIRE_ONE_LOBBY)
         _try_respond(ctx, "⏳ You're still recovering from the last expedition.")
         return
     ctx.sql.execute(_MEMBER_INSERT,
@@ -1568,11 +1672,12 @@ def comp_dungeon_begin(ctx, event):
         _try_respond(ctx, f"The horn needs a party of at least **{game.DUNGEON_MIN_PARTY}** — "
                           f"rally more heroes first.")
         return
+    # Defer BEFORE the claim: if the defer RPC fails, the lobby is still
+    # open and recoverable. (_try_respond falls back to followup after defer.)
+    ctx.interaction.defer(ephemeral=False)
     if not ctx.sql.execute(_CLAIM_RESOLUTION, [dungeon_id]):
         _try_respond(ctx, "📯 The horn has already sounded — the battle is underway!")
         return
-    # Resolution touches every member's row — buy time, then publish the battle.
-    ctx.interaction.defer(ephemeral=False)
     embed = _resolve_dungeon_safely(ctx, lobby, now, state["multiplier"])
     ctx.interaction.followup(embeds=[embed])
 
@@ -1586,7 +1691,7 @@ def _resolve_dungeon_safely(ctx, lobby, now, multiplier):
         ctx.log("EmberQuest dungeon resolution failed: " + str(exc), level="error",
                 request_id=ctx.request_id)
         try:
-            ctx.sql.execute(_FINISH_DUNGEON, [lobby["id"]])
+            _dungeon_terminal(ctx, lobby["id"], _FINISH_DUNGEON)
         except (SdkError, RuntimeError):
             pass
         return _embed(
@@ -1656,7 +1761,7 @@ def _resolve_dungeon(ctx, lobby, now, multiplier):
             line += f" · 🎉 now level {new_level}!"
         fields.append({"name": name, "value": line, "inline": False})
 
-    ctx.sql.execute(_FINISH_DUNGEON, [lobby["id"]])
+    _dungeon_terminal(ctx, lobby["id"], _FINISH_DUNGEON)
     ctx.metrics.record("dungeons_resolved",
                        tags={"dungeon": lobby["dungeon_key"], "won": str(result["win"])})
 
@@ -1930,10 +2035,19 @@ def _settle_social(ctx, player_row, xp_gain, coins_delta=None, duel_time=None) -
     return new_level - player_row["level"]
 
 
+def _duel_terminal(ctx, duel, statement) -> bool:
+    """Apply a terminal status transition and free the challenger's one-open
+    lock; the rowcount keeps every downstream refund exactly-once."""
+    if ctx.sql.execute(statement, [duel["id"]]):
+        _release_lock(ctx, "duel:" + str(duel["challenger_id"]), duel["id"])
+        return True
+    return False
+
+
 def _expire_duel_if_stale(ctx, duel, now) -> bool:
     if duel["status"] != "open" or now - int(duel["created_at"]) < game.DUEL_TTL:
         return duel["status"] in ("expired", "declined", "resolved")
-    if ctx.sql.execute(_DUEL_EXPIRE_CAS, [duel["id"]]):
+    if _duel_terminal(ctx, duel, _DUEL_EXPIRE_CAS):
         _refund_duel_stake(ctx, duel)  # epoch-guarded against Rekindling
     return True
 
@@ -1943,7 +2057,15 @@ def _sweep_stale_duels(ctx, now):
             "SELECT * FROM duels WHERE status = 'open' AND created_at < %s",
             [now - game.DUEL_TTL], limit=10):
         _expire_duel_if_stale(ctx, duel, now)
+    # A worker death mid-accept can orphan a 'resolving' row; long past any
+    # legitimate settlement, void it and send the recorded escrow home
+    # (epoch-guarded — refunds burn if the challenger has since Rekindled).
+    for duel in ctx.sql.query(_STUCK_RESOLVING_DUELS,
+                              [now - game.DUEL_TTL - 600], limit=10):
+        if _duel_terminal(ctx, duel, _DUEL_VOID_RESOLVING):
+            _quietly(_refund_duel_stake, ctx, duel)
     ctx.sql.execute(_PRUNE_DUELS, [now - 7 * 86400])
+    ctx.sql.execute(_PRUNE_LOCKS, [now - 7 * 86400])
 
 
 def _refund_duel_stake(ctx, duel):
@@ -1959,10 +2081,10 @@ def _reopen_or_void_duel(ctx, duel) -> bool:
     terminally and return the challenger's stake. True if it reopened."""
     try:
         if ctx.sql.execute(_DUEL_REOPEN, [duel["id"]]):
-            return True
+            return True  # still live: the lock stays held
     except (SdkError, RuntimeError):
         pass
-    if ctx.sql.execute(_DUEL_VOID_RESOLVING, [duel["id"]]):
+    if _duel_terminal(ctx, duel, _DUEL_VOID_RESOLVING):
         _refund_duel_stake(ctx, duel)
     return False
 
@@ -2008,26 +2130,52 @@ def cmd_duel(ctx, event):
         _try_respond(ctx, f"You can't cover a **{bet:,} {game.CURRENCY}** stake — "
                           f"you carry **{player['coins']:,}**.")
         return
-    duel_id = str(event.get("interaction_id") or now)
+    duel_id = str(event.get("interaction_id") or "")
+    if not duel_id:
+        duel_id = player["user_id"] + "-" + str(now)  # collision-proof fallback
     target_name = target["username"] or f"Hero {target_id[-4:]}"
+    # From here to the insert, the escrow is in flight: ONE wall covers the
+    # lock claim and the open so no exception can eat the stake unrefunded.
+    lock_held = False
     try:
-        opened = ctx.sql.execute(
-            _OPEN_DUEL,
-            [duel_id, player["user_id"], target_id, name, target_name,
-             bet, str(event.get("channel_id") or ""), now, _epoch(player),
-             player["user_id"], _epoch(player)])
+        # One live challenge per challenger: an atomic lock claim (the host's
+        # allowlist forbids CREATE UNIQUE INDEX, so the invariant lives here).
+        if not _acquire_lock(ctx, "duel", "duel:" + player["user_id"], duel_id, now):
+            if bet:
+                ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                                [name, bet, player["user_id"], _epoch(player)])
+            _try_respond(ctx, "You already have an open challenge — it must be "
+                              "answered or go cold (5m) first.")
+            return
+        lock_held = True
+        try:
+            opened = ctx.sql.execute(
+                _OPEN_DUEL,
+                [duel_id, player["user_id"], target_id, name, target_name,
+                 bet, str(event.get("channel_id") or ""), now, _epoch(player),
+                 player["user_id"], _epoch(player)])
+        except (SdkError, RuntimeError):
+            # Ambiguous failure (e.g. a timeout AFTER the host committed):
+            # re-read by id — refunding a stake that backs a live row would
+            # let its later expiry refund the same stake twice.
+            row = ctx.sql.query_one(_DUEL_OWNER, [duel_id])
+            opened = 1 if row and row["challenger_id"] == player["user_id"] else 0
+        if opened <= 0:
+            # Refund through the epoch guard: if the character Rekindled mid-
+            # handler, the pre-burn stake stays burned.
+            _release_lock(ctx, "duel:" + player["user_id"], duel_id)
+            if bet:
+                ctx.sql.execute(_CREDIT_COINS_EPOCH,
+                                [name, bet, player["user_id"], _epoch(player)])
+            _try_respond(ctx, "The flames shifted mid-challenge — try **/duel** again.")
+            return
     except (SdkError, RuntimeError):
-        opened = -1  # unique-index collision: another live challenge exists
-    if opened <= 0:
-        # Refund through the epoch guard: if the character Rekindled mid-
-        # handler (opened == 0), the pre-burn stake stays burned.
         if bet:
-            ctx.sql.execute(_CREDIT_COINS_EPOCH,
-                            [name, bet, player["user_id"], _epoch(player)])
-        _try_respond(ctx, "You already have an open challenge — it must be answered "
-                          "or go cold (5m) first." if opened == -1 else
-                          "The flames shifted mid-challenge — try **/duel** again.")
-        return
+            _quietly(ctx.sql.execute, _CREDIT_COINS_EPOCH,
+                     [name, bet, player["user_id"], _epoch(player)])
+        if lock_held:
+            _release_lock(ctx, "duel:" + player["user_id"], duel_id)
+        raise  # _safe answers the user
     stakes = (f"Stakes: **{bet:,} {game.CURRENCY} each** — winner takes the pot."
               if bet else "An honor bout — no Embers at stake.")
     ctx.interaction.respond(
@@ -2081,13 +2229,13 @@ def comp_duel_accept(ctx, event):
     try:
         challenger = _get_player(ctx, duel["challenger_id"])
         if challenger is None:
-            ctx.sql.execute(_DUEL_FINISH, [duel_id])
+            _duel_terminal(ctx, duel, _DUEL_FINISH)
             _try_respond(ctx, "Your challenger has vanished into the ash — no duel today.")
             return
         if int(duel.get("epoch") or 0) != _epoch(challenger):
             # The challenger Rekindled since staking: the challenge (and its
             # escrow) belongs to a character that no longer exists. Burn it.
-            if ctx.sql.execute(_DUEL_VOID_RESOLVING, [duel_id]):
+            if _duel_terminal(ctx, duel, _DUEL_VOID_RESOLVING):
                 _quietly(_refund_duel_stake, ctx, duel)  # epoch-guarded: burns
             _try_respond(ctx, "🔥 Your challenger's flame has burned out since the "
                               "challenge was made — it dissolves to ash.")
@@ -2104,7 +2252,7 @@ def comp_duel_accept(ctx, event):
         if not _claim_duel_cooldown(ctx, duel["challenger_id"], now):
             # The challenger spent their honor elsewhere since challenging.
             ctx.sql.execute(_REFUND_DUEL_COOLDOWN, [target["user_id"]])
-            if ctx.sql.execute(_DUEL_VOID_RESOLVING, [duel_id]):
+            if _duel_terminal(ctx, duel, _DUEL_VOID_RESOLVING):
                 _refund_duel_stake(ctx, duel)
             _try_respond(ctx, "⚔️ Your challenger already dueled elsewhere — the "
                               "challenge dissolves and any stake goes home.")
@@ -2134,14 +2282,14 @@ def comp_duel_accept(ctx, event):
         settled = True  # value starts moving here: never refund past this point
         winner_levels = _settle_social(ctx, winner, game.DUEL_XP_WIN, pot, now)
         _settle_social(ctx, loser, game.DUEL_XP_LOSS, 0, now)
-        ctx.sql.execute(_DUEL_FINISH, [duel_id])
+        _duel_terminal(ctx, duel, _DUEL_FINISH)
     except (SdkError, RuntimeError):
         if settled:
-            _quietly(ctx.sql.execute, _DUEL_FINISH, [duel_id])  # pot moved: close it out
+            _quietly(_duel_terminal, ctx, duel, _DUEL_FINISH)  # pot moved: close it out
         else:
             voided = False
             try:
-                voided = ctx.sql.execute(_DUEL_VOID_RESOLVING, [duel_id]) > 0
+                voided = _duel_terminal(ctx, duel, _DUEL_VOID_RESOLVING)
             except (SdkError, RuntimeError):
                 pass
             if voided:  # each refund is walled on its own — none may block another
@@ -2187,7 +2335,7 @@ def comp_duel_decline(ctx, event):
     if presser not in (duel["target_id"], duel["challenger_id"]):
         _try_respond(ctx, "⚔️ This challenge isn't yours to answer.")
         return
-    if not ctx.sql.execute(_DUEL_DECLINE_CAS, [duel_id]):
+    if not _duel_terminal(ctx, duel, _DUEL_DECLINE_CAS):
         _try_respond(ctx, "⚔️ That duel is already being settled.")
         return
     _refund_duel_stake(ctx, duel)
@@ -2205,6 +2353,13 @@ def comp_duel_decline(ctx, event):
 
 # --- /trade: player-to-player sales (Phase 3) ---------------------------------------------------
 
+def _trade_terminal(ctx, trade, statement) -> bool:
+    if ctx.sql.execute(statement, [trade["id"]]):
+        _release_lock(ctx, "trade:" + str(trade["seller_id"]), trade["id"])
+        return True
+    return False
+
+
 def _refund_trade_escrow(ctx, trade):
     # Epoch-guarded: goods escrowed before a Rekindling burn with the rest.
     returned = _add_item(ctx, trade["seller_id"], trade["item_id"], int(trade["qty"]),
@@ -2217,7 +2372,7 @@ def _refund_trade_escrow(ctx, trade):
 def _expire_trade_if_stale(ctx, trade, now) -> bool:
     if trade["status"] != "open" or now - int(trade["created_at"]) < game.TRADE_TTL:
         return trade["status"] in ("expired", "declined", "cancelled", "resolved")
-    if ctx.sql.execute(_TRADE_EXPIRE_CAS, [trade["id"]]):
+    if _trade_terminal(ctx, trade, _TRADE_EXPIRE_CAS):
         _refund_trade_escrow(ctx, trade)
     return True
 
@@ -2227,6 +2382,10 @@ def _sweep_stale_trades(ctx, now):
             "SELECT * FROM trades WHERE status = 'open' AND created_at < %s",
             [now - game.TRADE_TTL], limit=10):
         _expire_trade_if_stale(ctx, trade, now)
+    for trade in ctx.sql.query(_STUCK_RESOLVING_TRADES,
+                               [now - game.TRADE_TTL - 600], limit=10):
+        if _trade_terminal(ctx, trade, _TRADE_VOID_RESOLVING):
+            _quietly(_refund_trade_escrow, ctx, trade)
     ctx.sql.execute(_PRUNE_TRADES, [now - 7 * 86400])
 
 
@@ -2235,10 +2394,10 @@ def _reopen_or_void_trade(ctx, trade) -> bool:
     terminally and send the escrowed goods home. True if it reopened."""
     try:
         if ctx.sql.execute(_TRADE_REOPEN, [trade["id"]]):
-            return True
+            return True  # still live: the lock stays held
     except (SdkError, RuntimeError):
         pass
-    if ctx.sql.execute(_TRADE_VOID_RESOLVING, [trade["id"]]):
+    if _trade_terminal(ctx, trade, _TRADE_VOID_RESOLVING):
         _refund_trade_escrow(ctx, trade)
     return False
 
@@ -2303,22 +2462,37 @@ def cmd_trade(ctx, event):
             and _item_qty(ctx, player["user_id"], item_id) <= 0):
         if ctx.sql.execute(_CLEAR_PET_CAS, [player["user_id"], item_id]):
             unstrap_note = "\n*(Your companion waits in the trade crate — perk suspended.)*"
-    trade_id = str(event.get("interaction_id") or now)
+    trade_id = str(event.get("interaction_id") or "")
+    if not trade_id:
+        trade_id = player["user_id"] + "-" + str(now)  # collision-proof fallback
+    lock_held = False
     try:
-        opened = ctx.sql.execute(
-            _OPEN_TRADE,
-            [trade_id, player["user_id"], buyer_id, name, item_id, qty,
-             price, str(event.get("channel_id") or ""), now, _epoch(player),
-             player["user_id"], _epoch(player)])
+        if not _acquire_lock(ctx, "trade", "trade:" + player["user_id"], trade_id, now):
+            _add_item(ctx, player["user_id"], item_id, qty, epoch=_epoch(player))
+            _try_respond(ctx, "You already have an open offer — cancel it or let it "
+                              "lapse (10m) first.")
+            return
+        lock_held = True
+        try:
+            opened = ctx.sql.execute(
+                _OPEN_TRADE,
+                [trade_id, player["user_id"], buyer_id, name, item_id, qty,
+                 price, str(event.get("channel_id") or ""), now, _epoch(player),
+                 player["user_id"], _epoch(player)])
+        except (SdkError, RuntimeError):
+            row = ctx.sql.query_one(_TRADE_OWNER, [trade_id])
+            opened = 1 if row and row["seller_id"] == player["user_id"] else 0
+        if opened <= 0:
+            # Epoch-guarded return: goods taken from a since-Rekindled character burn.
+            _release_lock(ctx, "trade:" + player["user_id"], trade_id)
+            _add_item(ctx, player["user_id"], item_id, qty, epoch=_epoch(player))
+            _try_respond(ctx, "The flames shifted mid-offer — try **/trade** again.")
+            return
     except (SdkError, RuntimeError):
-        opened = -1  # unique-index collision: another live offer exists
-    if opened <= 0:
-        # Epoch-guarded return: goods taken from a since-Rekindled character burn.
-        _add_item(ctx, player["user_id"], item_id, qty, epoch=_epoch(player))
-        _try_respond(ctx, "You already have an open offer — cancel it or let it lapse "
-                          "(10m) first." if opened == -1 else
-                          "The flames shifted mid-offer — try **/trade** again.")
-        return
+        _quietly(_add_item, ctx, player["user_id"], item_id, qty, epoch=_epoch(player))
+        if lock_held:
+            _release_lock(ctx, "trade:" + player["user_id"], trade_id)
+        raise  # _safe answers the user
     buyer_name = buyer["username"] or f"Hero {buyer_id[-4:]}"
     deal = (f"**{item['emoji']} {item['name']} ×{qty}** for **{price:,} {game.CURRENCY}**"
             if price else f"**{item['emoji']} {item['name']} ×{qty}** — a gift!")
@@ -2366,7 +2540,7 @@ def comp_trade_accept(ctx, event):
         if seller is None or int(trade.get("epoch") or 0) != _epoch(seller):
             # The seller Rekindled since offering: the goods belong to a burned
             # character. Void the offer before taking the buyer's coins.
-            if ctx.sql.execute(_TRADE_VOID_RESOLVING, [trade_id]):
+            if _trade_terminal(ctx, trade, _TRADE_VOID_RESOLVING):
                 _quietly(_refund_trade_escrow, ctx, trade)  # epoch-guarded: burns
             _try_respond(ctx, "🔥 The seller's flame has burned out since this offer "
                               "was made — the goods are gone to ash.")
@@ -2386,15 +2560,15 @@ def comp_trade_accept(ctx, event):
             ctx.sql.execute(_CREDIT_COINS_EPOCH,
                             [trade["seller_name"], price, trade["seller_id"],
                              int(trade.get("epoch") or 0)])
-        ctx.sql.execute(_TRADE_FINISH, [trade_id])
+        _trade_terminal(ctx, trade, _TRADE_FINISH)
     except (SdkError, RuntimeError):
         if granted:
             # The goods were delivered: close the trade out, never refund.
-            _quietly(ctx.sql.execute, _TRADE_FINISH, [trade_id])
+            _quietly(_trade_terminal, ctx, trade, _TRADE_FINISH)
         else:
             voided = False
             try:
-                voided = ctx.sql.execute(_TRADE_VOID_RESOLVING, [trade_id]) > 0
+                voided = _trade_terminal(ctx, trade, _TRADE_VOID_RESOLVING)
             except (SdkError, RuntimeError):
                 pass
             if voided:  # each refund is walled on its own — none may block another
@@ -2429,7 +2603,7 @@ def comp_trade_decline(ctx, event):
     if str(event.get("user_id")) != trade["buyer_id"]:
         _try_respond(ctx, "💱 This offer isn't addressed to you.")
         return
-    if not ctx.sql.execute(_TRADE_DECLINE_CAS, [trade_id]):
+    if not _trade_terminal(ctx, trade, _TRADE_DECLINE_CAS):
         _try_respond(ctx, "💱 That trade was already settled elsewhere.")
         return
     _refund_trade_escrow(ctx, trade)
@@ -2452,7 +2626,7 @@ def comp_trade_cancel(ctx, event):
     if str(event.get("user_id")) != trade["seller_id"]:
         _try_respond(ctx, "💱 Only the seller can withdraw this offer.")
         return
-    if not ctx.sql.execute(_TRADE_CANCEL_CAS, [trade_id]):
+    if not _trade_terminal(ctx, trade, _TRADE_CANCEL_CAS):
         _try_respond(ctx, "💱 That trade was already settled elsewhere.")
         return
     _refund_trade_escrow(ctx, trade)
@@ -3255,12 +3429,12 @@ def _void_player_escrows(ctx, player):
     for duel in ctx.sql.query(
             "SELECT * FROM duels WHERE challenger_id = %s AND status = 'open'",
             [player["user_id"]], limit=5):
-        if ctx.sql.execute(_DUEL_EXPIRE_CAS, [duel["id"]]):
+        if _duel_terminal(ctx, duel, _DUEL_EXPIRE_CAS):
             _quietly(_refund_duel_stake, ctx, duel)
     for trade in ctx.sql.query(
             "SELECT * FROM trades WHERE seller_id = %s AND status = 'open'",
             [player["user_id"]], limit=5):
-        if ctx.sql.execute(_TRADE_EXPIRE_CAS, [trade["id"]]):
+        if _trade_terminal(ctx, trade, _TRADE_EXPIRE_CAS):
             _quietly(_refund_trade_escrow, ctx, trade)
 
 

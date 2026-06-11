@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1 — Live-host fixes (2026-06-12)
+
+First production deploy surfaced two host behaviors the SDK doesn't document:
+
+- **The host's SQL allowlist rejects `CREATE UNIQUE INDEX`** (only plain statement types are
+  permitted), and the failed statement aborted the rest of the schema bootstrap. Every DDL
+  statement is now individually error-walled, and the one-open invariants (dungeon lobby,
+  duel challenge, trade offer) moved from partial unique indexes to an allowlist-legal
+  **locks table**: atomic `INSERT … ON CONFLICT DO NOTHING` claims, released on every
+  terminal transition, with self-healing recovery of locks orphaned by crashed handlers.
+- **The live gateway sends `user_username`**, not the `user_name` the SDK's typed schema
+  documents — usernames were stored blank. Both fields are now accepted.
+- A regression meta-test scans every shipped SQL literal against the host's statement-type
+  allowlist so this class of rejection can't return.
+
 ## 0.4.0 — Phase 4: Progression & flavor (2026-06-12)
 
 - **Companions** (`/pet`): five pets with distinct passive perks, hatched from caches,

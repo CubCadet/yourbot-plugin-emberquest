@@ -121,8 +121,11 @@ built around single-statement atomicity:
 - Money and items move **debit-first, grant-after**; a mid-sequence failure can cost a player a
   reward but can never mint value. Escrows refund through CAS status transitions so each refund
   happens exactly once, with every compensation step independently error-walled.
-- One-open invariants (dungeon lobby, duel challenge, trade offer) are enforced with **partial
-  unique indexes** whose predicates cover the transient `resolving` state.
+- One-open invariants (dungeon lobby, duel challenge, trade offer) ride a **locks table**:
+  `INSERT … ON CONFLICT DO NOTHING` is an atomic insert-once claim, released on every terminal
+  transition and self-healing if a holder dies. (The host's SQL allowlist permits only plain
+  statement types — `CREATE UNIQUE INDEX` is rejected, so DB-level partial unique indexes are
+  not available.)
 - The prestige reset treats `rekindles` as a **character epoch**: every settlement, grant, and
   escrow refund derived from a stale read carries `AND rekindles = %s`, so value computed
   against a character that has since been reborn burns instead of resurrecting.
