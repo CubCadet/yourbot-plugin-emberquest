@@ -1,0 +1,97 @@
+{
+  "pages": [
+    {
+      "id": "overview",
+      "title": "Overview",
+      "widgets": [
+        {
+          "id": "stat_players",
+          "type": "stat_card",
+          "title": "Registered players",
+          "width": "third",
+          "refresh_seconds": 60,
+          "rpc_method": "get_player_count",
+          "label": "Registered players"
+        },
+        {
+          "id": "stat_commands_today",
+          "type": "stat_card",
+          "title": "Commands today",
+          "width": "third",
+          "refresh_seconds": 60,
+          "rpc_method": "get_commands_today",
+          "label": "Commands today"
+        },
+        {
+          "id": "stat_economy_total",
+          "type": "stat_card",
+          "title": "Embers in economy",
+          "width": "third",
+          "refresh_seconds": 60,
+          "rpc_method": "get_economy_total",
+          "label": "Embers in economy"
+        },
+        {
+          "id": "stat_dungeons_cleared",
+          "type": "stat_card",
+          "title": "Dungeons cleared (30d)",
+          "width": "third",
+          "refresh_seconds": 300,
+          "rpc_method": "get_dungeons_cleared",
+          "label": "Dungeons cleared (30d)"
+        },
+        {
+          "id": "stat_duels_fought",
+          "type": "stat_card",
+          "title": "Duels fought (30d)",
+          "width": "third",
+          "refresh_seconds": 300,
+          "rpc_method": "get_duels_fought",
+          "label": "Duels fought (30d)"
+        },
+        {
+          "id": "chart_commands_7d",
+          "type": "chart",
+          "title": "Commands \u2014 7 days",
+          "width": "full",
+          "refresh_seconds": 300,
+          "rpc_method": "get_commands_chart",
+          "chart_type": "line"
+        }
+      ]
+    },
+    {
+      "id": "settings",
+      "title": "Settings",
+      "widgets": [
+        {
+          "id": "economy_settings",
+          "type": "form",
+          "title": "Economy settings",
+          "width": "full",
+          "rpc_method": "get_settings",
+          "save_rpc_method": "save_settings",
+          "fields": [
+            {
+              "key": "economy_multiplier",
+              "label": "Economy multiplier",
+              "type": "number",
+              "help_text": "Scales Ember rewards from hunts, adventures, dailies, dungeons, and the arena prize bonus (0.1\u201310).",
+              "min": 0.1,
+              "max": 10,
+              "step": 0.1
+            },
+            {
+              "key": "allowed_channel_id",
+              "label": "Allowed channel",
+              "type": "channel",
+              "help_text": "Restrict EmberQuest commands to one channel. Leave empty to allow all."
+            }
+          ]
+        }
+      ],
+      "permission": "manager"
+    }
+  ],
+  "mode": "manifest"
+}

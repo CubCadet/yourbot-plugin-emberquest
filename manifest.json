@@ -1,0 +1,69 @@
+{
+  "id": "emberquest",
+  "name": "EmberQuest",
+  "version": "0.3.0",
+  "description": "An original Discord RPG set in the Cinderwilds — hunt ash-born monsters, raid dungeon minibosses with your party, duel rivals, trade with friends, found guilds, fight in the daily arena, craft and enchant gear, and gamble Embers (virtual currency, no real-world value). Includes an admin dashboard with live stats and a tunable economy.",
+  "author": "EmberStream Studio",
+  "tags": ["rpg", "economy", "game", "fun"],
+  "capabilities_required": ["interaction:respond", "storage:kv", "storage:sql", "discord:send_message"],
+  "capabilities_requested": ["interaction:respond", "storage:kv", "storage:sql", "discord:send_message"],
+  "slash_commands": [
+    { "name": "start", "description": "Begin your adventure in the Cinderwilds" },
+    { "name": "profile", "description": "View a hero's level, HP, Embers, and gear",
+      "options": [
+        { "name": "user", "description": "Whose hero to view", "type": 6, "required": false }
+      ] },
+    { "name": "hunt", "description": "Hunt a monster for Embers and XP (60s cooldown)" },
+    { "name": "adventure", "description": "A longer expedition — bigger rewards, bigger risk (1h cooldown)" },
+    { "name": "heal", "description": "Drink a healing tonic (buys one if you have none) to restore HP" },
+    { "name": "inventory", "description": "See your items and equipped gear" },
+    { "name": "shop", "description": "Browse the Emberforge shop" },
+    { "name": "buy", "description": "Buy an item from the shop",
+      "options": [
+        { "name": "item", "description": "Item name", "type": 3, "required": true }
+      ] },
+    { "name": "sell", "description": "Sell an item back at half price",
+      "options": [
+        { "name": "item", "description": "Item name", "type": 3, "required": true }
+      ] },
+    { "name": "daily", "description": "Claim your daily Ember stipend (24h)" },
+    { "name": "leaderboard", "description": "Top heroes on this server",
+      "options": [
+        { "name": "metric", "description": "Rank by: level (default), coins, or guild", "type": 3, "required": false }
+      ] },
+    { "name": "coinflip", "description": "Flip for Embers — virtual currency, no real value",
+      "options": [
+        { "name": "bet", "description": "Embers to wager", "type": 4, "required": true }
+      ] },
+    { "name": "dungeon", "description": "Open or view a party expedition against a miniboss (2-4 heroes)",
+      "options": [
+        { "name": "target", "description": "Which dungeon to open (omit for the best fit)", "type": 3, "required": false }
+      ] },
+    { "name": "craft", "description": "Forge gear and tonics from dungeon materials",
+      "options": [
+        { "name": "item", "description": "Recipe to craft (omit to list recipes)", "type": 3, "required": false }
+      ] },
+    { "name": "enchant", "description": "Enchant your equipped gear with Ember Shards",
+      "options": [
+        { "name": "slot", "description": "Which slot: sword or armor", "type": 3, "required": true }
+      ] },
+    { "name": "duel", "description": "Challenge another hero to a duel (10m cooldown) — optionally for an Ember stake (virtual currency)",
+      "options": [
+        { "name": "user", "description": "Who to challenge", "type": 6, "required": true },
+        { "name": "bet", "description": "Embers each fighter stakes (winner takes the pot)", "type": 4, "required": false }
+      ] },
+    { "name": "trade", "description": "Offer an item to another hero for Embers",
+      "options": [
+        { "name": "user", "description": "Who to trade with", "type": 6, "required": true },
+        { "name": "item", "description": "Item to offer", "type": 3, "required": true },
+        { "name": "price", "description": "Asking price in Embers (0 = gift)", "type": 4, "required": true },
+        { "name": "qty", "description": "How many (default 1)", "type": 4, "required": false }
+      ] },
+    { "name": "guild", "description": "Found, join, or inspect a guild",
+      "options": [
+        { "name": "action", "description": "create, join, leave, or info", "type": 3, "required": true },
+        { "name": "name", "description": "Guild name (for create/join/info)", "type": 3, "required": false }
+      ] },
+    { "name": "arena", "description": "Enter today's arena tournament (daily, 50-Ember fee, virtual currency)" }
+  ]
+}

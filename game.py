@@ -1,0 +1,487 @@
+"""EmberQuest game logic — static catalogs and pure balance math.
+
+No SDK imports, no ctx, no I/O. Every random outcome flows through an injected
+``random.Random`` so the whole module is deterministic under test.
+
+All names, mobs, and locations are original EmberQuest IP.
+"""
+
+from __future__ import annotations
+
+import time
+
+CURRENCY = "Embers"
+VIRTUAL_NOTE = "Embers are virtual in-game currency with no real-world value."
+
+# Cooldowns (seconds). Enforced lazily against SQL timestamps on each command;
+# ctx.ephemeral is only ever a fast spam guard on top of these.
+HUNT_COOLDOWN = 60
+ADVENTURE_COOLDOWN = 3600
+DAILY_COOLDOWN = 86400
+
+REGEN_SECONDS_PER_HP = 120
+BASE_MAX_HP = 100
+MAX_HP_PER_LEVEL = 10
+DEFEAT_COIN_LOSS = 0.10  # fraction of carried Embers lost when knocked out
+SELL_RATIO = 0.5
+MIN_BET = 10
+LOW_HP_FRACTION = 0.35  # below this, combat responses offer a Heal button
+
+DEFAULT_SWORD = "fists"
+DEFAULT_ARMOR = "cloth"
+LIFE_POTION = "ember_tonic"
+GREATER_LIFE_POTION = "phoenix_draught"
+LIFE_POTION_HEAL = 50
+
+ITEMS = {
+    # Swords — atk raises win chance and shaves incoming damage.
+    "fists": {"name": "Fists", "kind": "sword", "atk": 0, "price": None, "emoji": "✊"},
+    "charstick": {"name": "Charstick", "kind": "sword", "atk": 3, "price": 150, "emoji": "🪵"},
+    "cinder_saber": {"name": "Cinder Saber", "kind": "sword", "atk": 7, "price": 600, "emoji": "🗡️"},
+    "ironspark_blade": {"name": "Ironspark Blade", "kind": "sword", "atk": 12, "price": 2000, "emoji": "⚔️"},
+    "emberglass_edge": {"name": "Emberglass Edge", "kind": "sword", "atk": 18, "price": 6000, "emoji": "🔶"},
+    "pyrelord_greatsword": {"name": "Pyrelord Greatsword", "kind": "sword", "atk": 25, "price": 15000, "emoji": "🔥"},
+    # Armor — defense reduces incoming damage.
+    "cloth": {"name": "Traveler's Cloth", "kind": "armor", "defense": 0, "price": None, "emoji": "🧣"},
+    "padded_vest": {"name": "Padded Vest", "kind": "armor", "defense": 2, "price": 120, "emoji": "🦺"},
+    "kindled_mail": {"name": "Kindled Mail", "kind": "armor", "defense": 5, "price": 500, "emoji": "🪖"},
+    "ashforged_plate": {"name": "Ashforged Plate", "kind": "armor", "defense": 9, "price": 1800, "emoji": "🛡️"},
+    "emberweave_aegis": {"name": "Emberweave Aegis", "kind": "armor", "defense": 14, "price": 5000, "emoji": "✨"},
+    # Consumables.
+    LIFE_POTION: {"name": "Emberbloom Tonic", "kind": "consumable", "heal": LIFE_POTION_HEAL, "price": 80, "emoji": "🧪"},
+    GREATER_LIFE_POTION: {"name": "Phoenix Draught", "kind": "consumable", "heal": None, "price": 250, "emoji": "⚗️"},
+    # Materials — drop from dungeons (and rarely hunts/adventures); never sold
+    # in the shop (price None), but the Emberforge buys them back ("sell").
+    "ember_shard": {"name": "Ember Shard", "kind": "material", "price": None, "sell": 15, "emoji": "✴️"},
+    "wraithsilk": {"name": "Wraithsilk", "kind": "material", "price": None, "sell": 40, "emoji": "🕸️"},
+    "ashsteel_ingot": {"name": "Ashsteel Ingot", "kind": "material", "price": None, "sell": 120, "emoji": "🔩"},
+    "magmaheart": {"name": "Magmaheart", "kind": "material", "price": None, "sell": 400, "emoji": "🌋"},
+    # Craft-only gear — above the shop's top tier; never buyable.
+    "dawnforged_blade": {"name": "Dawnforged Blade", "kind": "sword", "atk": 30, "price": None, "sell": 4000, "emoji": "🌅"},
+    "wraithsilk_shroud": {"name": "Wraithsilk Shroud", "kind": "armor", "defense": 17, "price": None, "sell": 3200, "emoji": "🌫️"},
+}
+
+MOBS = [
+    {"id": "cinder_slime", "name": "Cinder Slime", "tier": 1, "min_level": 1},
+    {"id": "ash_hare", "name": "Ash Hare", "tier": 1, "min_level": 1},
+    {"id": "soot_imp", "name": "Soot Imp", "tier": 2, "min_level": 3},
+    {"id": "glowmoth", "name": "Glowmoth", "tier": 2, "min_level": 5},
+    {"id": "charhound", "name": "Charhound", "tier": 3, "min_level": 8},
+    {"id": "wick_wraith", "name": "Wick Wraith", "tier": 3, "min_level": 12},
+    {"id": "magmite", "name": "Magmite", "tier": 4, "min_level": 16},
+    {"id": "pyreclaw", "name": "Pyreclaw", "tier": 5, "min_level": 20},
+]
+
+ADVENTURES = [
+    {"id": "smoldering_fen", "name": "the Smoldering Fen", "tier": 1, "min_level": 1},
+    {"id": "ashfall_ruins", "name": "the Ashfall Ruins", "tier": 2, "min_level": 5},
+    {"id": "glasswastes", "name": "the Glasswastes", "tier": 3, "min_level": 10},
+    {"id": "caldera_throat", "name": "the Caldera Throat", "tier": 4, "min_level": 15},
+]
+
+# --- Dungeons (Phase 2): party expeditions against minibosses -----------------
+
+DUNGEON_MIN_PARTY = 2
+DUNGEON_MAX_PARTY = 4
+DUNGEON_COOLDOWN = 7200       # per player, claimed at resolution (not at join)
+DUNGEON_LOBBY_TTL = 900       # open lobbies go cold after 15 minutes (lazy expiry)
+
+# drops: (item_id, probability, min_count, max_count) rolled per member on a win.
+DUNGEONS = {
+    "kiln": {
+        "name": "the Smelterdeep", "boss": "the Kilnwarden",
+        "min_level": 3, "tier": 2, "power": 60,
+        "drops": [("ember_shard", 0.9, 1, 2), ("wraithsilk", 0.5, 1, 1)],
+    },
+    "cinderkeep": {
+        "name": "the Sunken Cinderkeep", "boss": "the Drowned Ember-Knight",
+        "min_level": 8, "tier": 3, "power": 150,
+        "drops": [("ember_shard", 0.9, 1, 3), ("wraithsilk", 0.6, 1, 2),
+                  ("ashsteel_ingot", 0.5, 1, 1)],
+    },
+    "crucible": {
+        "name": "the Pyrelord's Crucible", "boss": "the Avatar of the Pyrelord",
+        "min_level": 15, "tier": 5, "power": 300,
+        "drops": [("wraithsilk", 0.5, 1, 2), ("ashsteel_ingot", 0.7, 1, 2),
+                  ("magmaheart", 0.35, 1, 1)],
+    },
+}
+
+# --- Crafting (Phase 2) --------------------------------------------------------
+
+RECIPES = {
+    LIFE_POTION: {"materials": {"ember_shard": 1}, "fee": 20},
+    GREATER_LIFE_POTION: {"materials": {"ember_shard": 2, "wraithsilk": 1}, "fee": 100},
+    "dawnforged_blade": {"materials": {"ashsteel_ingot": 3, "magmaheart": 1}, "fee": 2500},
+    "wraithsilk_shroud": {"materials": {"wraithsilk": 4, "ashsteel_ingot": 2}, "fee": 2000},
+}
+
+# --- Enchanting (Phase 2) --------------------------------------------------------
+
+ENCHANT_MAX = 5
+ENCHANT_BONUS = 2             # +atk or +def per enchant level
+ENCHANT_MATERIAL = "ember_shard"
+
+# --- PvP duels (Phase 3) -----------------------------------------------------------
+
+DUEL_TTL = 300                # an unanswered challenge goes cold after 5 minutes
+DUEL_COOLDOWN = 600           # per player, set at resolution for both fighters
+DUEL_XP_WIN = 25
+DUEL_XP_LOSS = 10
+DUEL_MAX_BET = 1_000_000
+
+# --- Trading (Phase 3) ---------------------------------------------------------------
+
+TRADE_TTL = 600               # an unanswered offer goes cold after 10 minutes
+TRADE_MAX_QTY = 25
+TRADE_MAX_PRICE = 10_000_000
+
+# --- Guilds (Phase 3) -----------------------------------------------------------------
+
+GUILD_CREATE_COST = 2500      # Ember sink
+GUILD_MAX_MEMBERS = 20
+GUILD_NAME_MIN = 3
+GUILD_NAME_MAX = 24
+_GUILD_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyz"
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 '-")
+
+# --- Daily arena (Phase 3) ---------------------------------------------------------------
+
+ARENA_FEE = 50
+ARENA_BONUS = 100             # house Embers added to the pool, scaled by multiplier
+ARENA_SPLITS = (0.5, 0.3, 0.2)
+ARENA_XP = 15
+
+
+# --- Leveling ---------------------------------------------------------------
+
+def xp_for_level(level: int) -> int:
+    """Cumulative XP required to *be* `level`. Level 1 starts at 0."""
+    return 50 * level * (level - 1)
+
+
+def level_from_xp(xp: int) -> int:
+    level = 1
+    while xp >= xp_for_level(level + 1):
+        level += 1
+    return level
+
+
+def max_hp_for_level(level: int) -> int:
+    return BASE_MAX_HP + MAX_HP_PER_LEVEL * (level - 1)
+
+
+def xp_progress(level: int, xp: int) -> tuple[int, int]:
+    """(xp gained within the current level, xp span of the current level)."""
+    floor = xp_for_level(level)
+    return xp - floor, xp_for_level(level + 1) - floor
+
+
+def regen_hp(hp: int, max_hp: int, last_action_at: int, now: int) -> int:
+    """Lazy regen: +1 HP per REGEN_SECONDS_PER_HP since the last action."""
+    if last_action_at <= 0 or now <= last_action_at:
+        return min(hp, max_hp)
+    return min(max_hp, hp + (now - last_action_at) // REGEN_SECONDS_PER_HP)
+
+
+# --- Encounters -------------------------------------------------------------
+
+def _eligible(catalog, level):
+    return [entry for entry in catalog if level >= entry["min_level"]]
+
+
+def resolve_hunt(level, atk, defense, hp, coins, rng, multiplier):
+    """One /hunt. RNG call order is fixed: choice, random, then randints."""
+    mob = rng.choice(_eligible(MOBS, level))
+    tier = mob["tier"]
+    win_chance = min(0.95, 0.78 + 0.005 * atk + 0.01 * max(0, level - mob["min_level"]))
+    win = rng.random() < win_chance
+    if win:
+        coins_gain = max(1, round(rng.randint(10, 18) * tier * multiplier))
+        xp_gain = rng.randint(10, 16) * tier
+        damage = max(0, rng.randint(2, 6) * tier - defense)
+    else:
+        coins_gain = 0
+        xp_gain = 0
+        damage = max(1, rng.randint(6, 12) * tier - defense)
+    result = _settle(mob, win, coins_gain, xp_gain, damage, hp, coins)
+    result["drop"] = None
+    if result["win"] and rng.random() < 0.07:
+        result["drop"] = "ember_shard"  # rare solo trickle toward crafting
+    return result
+
+
+def resolve_adventure(level, atk, defense, hp, coins, rng, multiplier):
+    """One /adventure: bigger band than hunt, plus a potion drop chance."""
+    place = rng.choice(_eligible(ADVENTURES, level))
+    tier = place["tier"]
+    win_chance = min(0.92, 0.70 + 0.006 * atk + 0.01 * max(0, level - place["min_level"]))
+    win = rng.random() < win_chance
+    drop = None
+    if win:
+        coins_gain = max(1, round(rng.randint(60, 110) * tier * multiplier))
+        xp_gain = rng.randint(55, 85) * tier
+        damage = max(0, rng.randint(5, 12) * tier - defense)
+        roll = rng.random()
+        if roll < 0.05:
+            drop = GREATER_LIFE_POTION
+        elif roll < 0.30:
+            drop = LIFE_POTION
+    else:
+        coins_gain = 0
+        xp_gain = 0
+        damage = max(1, rng.randint(12, 20) * tier - defense)
+    material = None
+    if win:
+        material_roll = rng.random()
+        if material_roll < 0.15:
+            material = "wraithsilk"
+        elif material_roll < 0.40:
+            material = "ember_shard"
+    result = _settle(place, win, coins_gain, xp_gain, damage, hp, coins)
+    result["drop"] = None if result["defeated"] else drop
+    result["material"] = None if result["defeated"] else material
+    return result
+
+
+def _settle(foe, win, coins_gain, xp_gain, damage, hp, coins):
+    defeated = damage >= hp
+    if defeated:
+        # Knocked out: HP floors at 1, a cut of carried Embers is lost, no spoils.
+        return {
+            "foe": foe, "win": False, "defeated": True, "damage": damage,
+            "hp_after": 1, "coins_delta": -int(coins * DEFEAT_COIN_LOSS), "xp_gain": 0,
+        }
+    return {
+        "foe": foe, "win": win, "defeated": False, "damage": damage,
+        "hp_after": hp - damage, "coins_delta": coins_gain, "xp_gain": xp_gain,
+    }
+
+
+def resolve_dungeon(member_stats, dungeon, rng, multiplier):
+    """Resolve a party expedition. RNG order is fixed: party roll, win roll,
+    then per-member rolls in roster order (randints, then drop rolls).
+
+    member_stats: [{"user_id", "username", "level", "atk", "defense", "hp"}, ...]
+    Defeated members are dragged out at 1 HP and keep half loot.
+    """
+    tier = dungeon["tier"]
+    party_power = sum(m["level"] * 3 + m["atk"] * 2 + 10 for m in member_stats)
+    party_power += rng.randint(0, 10)
+    win_chance = min(0.92, max(0.25, party_power / (party_power + dungeon["power"])))
+    win = rng.random() < win_chance
+
+    outcomes = []
+    for member in member_stats:
+        if win:
+            damage = max(0, rng.randint(3, 9) * tier - member["defense"])
+            coins = max(1, round(rng.randint(80, 140) * tier * multiplier))
+            xp = rng.randint(70, 110) * tier
+        else:
+            damage = max(1, rng.randint(10, 18) * tier - member["defense"])
+            coins = 0
+            xp = 0
+        defeated = damage >= member["hp"]
+        hp_after = 1 if defeated else member["hp"] - damage
+        drops = []
+        if win:
+            for item_id, probability, lo, hi in dungeon["drops"]:
+                if rng.random() < probability:
+                    drops.append((item_id, rng.randint(lo, hi)))
+        if defeated:
+            coins //= 2
+            xp //= 2
+            drops = drops[:1]  # dragged out unconscious: most of the haul is lost
+        outcomes.append({
+            "user_id": member["user_id"], "username": member["username"],
+            "damage": damage, "hp_after": hp_after, "defeated": defeated,
+            "coins": coins, "xp": xp, "drops": drops,
+        })
+    return {"win": win, "win_chance": win_chance, "outcomes": outcomes}
+
+
+# --- PvP duels -------------------------------------------------------------------
+
+def duel_power(level: int, atk: int, defense: int) -> int:
+    return level * 3 + atk * 2 + defense + 5
+
+
+def resolve_duel(challenger: dict, target: dict, rng) -> dict:
+    """Honor bout: no HP at stake, the pot and pride change hands.
+
+    challenger/target: {"level", "atk", "defense"} (effective stats).
+    The underdog always keeps a fighting chance (clamped 15–85%).
+    """
+    power_c = duel_power(challenger["level"], challenger["atk"], challenger["defense"])
+    power_t = duel_power(target["level"], target["atk"], target["defense"])
+    chance = min(0.85, max(0.15, power_c / (power_c + power_t)))
+    return {"challenger_wins": rng.random() < chance, "chance": chance}
+
+
+# --- Guilds -----------------------------------------------------------------------
+
+def guild_key(name: str) -> str:
+    return _normalize(name)
+
+
+def validate_guild_name(name: str) -> str | None:
+    """None if the name is acceptable, else a player-facing error."""
+    name = str(name or "").strip()
+    if len(name) < GUILD_NAME_MIN or len(name) > GUILD_NAME_MAX:
+        return (f"Guild names run {GUILD_NAME_MIN}–{GUILD_NAME_MAX} characters "
+                f"(yours is {len(name)}).")
+    if not set(name) <= _GUILD_NAME_CHARS:
+        return "Guild names may use letters, numbers, spaces, apostrophes, and dashes."
+    if not any(c.isalnum() for c in name):
+        return "A guild name needs at least one letter or number."
+    return None
+
+
+# --- Daily arena ---------------------------------------------------------------------
+
+def arena_day(ts: int) -> str:
+    """UTC calendar day bucket for arena entries, e.g. '2026-06-11'."""
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def arena_score(level: int, atk: int, defense: int, rng) -> int:
+    return level * 3 + atk * 2 + defense + rng.randint(0, 50)
+
+
+def arena_pool(total_fees: int, multiplier: float) -> int:
+    return int(total_fees) + max(0, round(ARENA_BONUS * multiplier))
+
+
+def arena_payouts(pool: int) -> list[int]:
+    """Podium shares (1st, 2nd, 3rd); never exceeds the pool in total."""
+    return [int(pool * share) for share in ARENA_SPLITS]
+
+
+# --- Enchanting ----------------------------------------------------------------
+
+def enchant_cost(next_level: int) -> dict:
+    return {"coins": 100 * next_level * next_level, "materials": next_level}
+
+
+def enchant_success_chance(current_level: int) -> float:
+    return max(0.25, 0.95 - 0.15 * current_level)
+
+
+def enchant_attempt(current_level: int, rng) -> bool:
+    return rng.random() < enchant_success_chance(current_level)
+
+
+def effective_atk(sword_id: str, enchant_level: int) -> int:
+    return ITEMS[sword_id]["atk"] + ENCHANT_BONUS * enchant_level
+
+
+def effective_defense(armor_id: str, enchant_level: int) -> int:
+    return ITEMS[armor_id]["defense"] + ENCHANT_BONUS * enchant_level
+
+
+# --- Economy ----------------------------------------------------------------
+
+def daily_reward(level: int, multiplier: float) -> dict:
+    return {"coins": max(1, round((150 + 25 * level) * multiplier)), "item": LIFE_POTION}
+
+
+def coinflip(bet: int, balance: int, rng) -> dict:
+    """Fair 50/50 flip; the wager is clamped to the player's balance."""
+    wager = min(bet, balance)
+    won = rng.random() < 0.5
+    return {"wager": wager, "won": won, "delta": wager if won else -wager}
+
+
+def sell_price(item_id: str) -> int:
+    item = ITEMS[item_id]
+    if "sell" in item:
+        return item["sell"]
+    price = item.get("price")
+    return int(price * SELL_RATIO) if price else 0
+
+
+def best_gear(kind: str, owned_item_ids) -> str:
+    """Best owned item of `kind` by stat, falling back to the bare default."""
+    default = DEFAULT_SWORD if kind == "sword" else DEFAULT_ARMOR
+    stat_key = "atk" if kind == "sword" else "defense"
+    best, best_stat = default, ITEMS[default][stat_key]
+    for item_id in owned_item_ids:
+        item = ITEMS.get(item_id)
+        if item and item["kind"] == kind and item[stat_key] > best_stat:
+            best, best_stat = item_id, item[stat_key]
+    return best
+
+
+def _normalize(query: str) -> str:
+    return str(query or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def find_item(query: str) -> str | None:
+    """Resolve user input to an item id (case/space/underscore-insensitive)."""
+    needle = _normalize(query)
+    if not needle:
+        return None
+    for item_id, item in ITEMS.items():
+        if needle == item_id or needle == _normalize(item["name"]):
+            return item_id
+    return None
+
+
+def find_recipe(query: str) -> str | None:
+    item_id = find_item(query)
+    return item_id if item_id in RECIPES else None
+
+
+def find_dungeon(query: str) -> str | None:
+    needle = _normalize(query)
+    if not needle:
+        return None
+    for key, dungeon in DUNGEONS.items():
+        names = (key, _normalize(dungeon["name"]), _normalize(dungeon["name"]).removeprefix("the_"),
+                 _normalize(dungeon["boss"]), _normalize(dungeon["boss"]).removeprefix("the_"))
+        if needle in names:
+            return key
+    return None
+
+
+def pick_dungeon(level: int, query: str | None = None) -> str | None:
+    """Explicit pick by name, else the hardest dungeon the level qualifies for."""
+    if query:
+        return find_dungeon(query)
+    best = None
+    for key, dungeon in DUNGEONS.items():
+        if level >= dungeon["min_level"]:
+            if best is None or dungeon["min_level"] > DUNGEONS[best]["min_level"]:
+                best = key
+    return best
+
+
+def shop_pages() -> list[tuple[str, list[str]]]:
+    """Ordered shop pages of purchasable item ids, grouped by kind."""
+    def of_kind(kind):
+        return [i for i, it in ITEMS.items() if it["kind"] == kind and it["price"]]
+    return [
+        ("Swords", of_kind("sword")),
+        ("Armor", of_kind("armor")),
+        ("Potions", of_kind("consumable")),
+    ]
+
+
+# --- Presentation helpers (pure) --------------------------------------------
+
+def progress_bar(value: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return "░" * width
+    filled = max(0, min(width, round(width * value / total)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def fmt_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"

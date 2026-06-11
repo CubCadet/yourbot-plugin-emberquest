@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[co]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+
+# Release artifacts — built from source, attach to GitHub Releases instead
+dist/
+
+# OS noise
+.DS_Store
+Thumbs.db
