@@ -99,7 +99,7 @@ uv pip install --python .venv/bin/python "yourbot-sdk>=0.6.1,<0.7" pytest
 ### Project layout
 
 ```
-├── manifest.json            # plugin id/version, capabilities, 19 slash commands
+├── manifest.json            # plugin id/version, capabilities, 24 slash commands
 ├── __main__.py              # sandbox entry point
 ├── handlers.py              # all slash/component/lifecycle/dashboard handlers
 ├── game.py                  # pure game logic: catalogs, RNG math, balance (no SDK imports)
@@ -155,7 +155,7 @@ root). Review turnaround is typically 1–3 business days.
 
 ## Versions
 
-See [CHANGELOG.md](CHANGELOG.md). Current: **0.4.0**.
+See [CHANGELOG.md](CHANGELOG.md). Current: **0.4.2**.
 
 ## License
 

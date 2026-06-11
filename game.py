@@ -169,7 +169,7 @@ ARENA_XP = 15
 # One active companion per hero; each grants a single passive perk. Values are
 # the perk magnitudes consumed by player_boosts() / arena scoring / quests.
 PET_PERKS = {
-    "cinderpup": {"label": "+10% Embers from hunts & adventures", "coins": 0.10},
+    "cinderpup": {"label": "+10% Embers from hunts, adventures & dailies", "coins": 0.10},
     "ashwhisker": {"label": "+10% XP from hunts & adventures", "xp": 0.10},
     "wisplight": {"label": "+8% material drop chance", "drop": 0.08},
     "pyrelet": {"label": "+10 arena score", "arena": 10},
@@ -214,7 +214,8 @@ QUEST_XP = 25
 QUEST_PRUNE_DAYS = 7
 
 # event_key is what handlers report progress against; target is (lo, hi);
-# reward is base Embers (plus 10×level at claim, plus pet/season bonuses).
+# reward is base Embers plus 10×level at claim (the Emberowl perk boosts it;
+# seasons deliberately do not — they boost the underlying activities instead).
 QUEST_TYPES = {
     "hunt_win": {"desc": "Best {n} monsters with /hunt", "target": (4, 8), "reward": 140},
     "adventure_win": {"desc": "Return victorious from {n} adventure(s)", "target": (1, 2), "reward": 160},

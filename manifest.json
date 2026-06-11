@@ -1,7 +1,7 @@
 {
   "id": "emberquest",
   "name": "EmberQuest",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "An original Discord RPG set in the Cinderwilds — hunt ash-born monsters, raid dungeon minibosses with your party, duel rivals, trade with friends, found guilds, fight in the daily arena, hatch companions from Ember Caches, clear daily quests, chase seasonal events, and Rekindle your legend for permanent bonuses. Embers are virtual currency with no real-world value. Includes an admin dashboard with live stats and a tunable economy.",
   "author": "EmberStream Studio",
   "tags": ["rpg", "economy", "game", "fun"],
@@ -35,7 +35,7 @@
       "options": [
         { "name": "bet", "description": "Embers to wager", "type": 4, "required": true }
       ] },
-    { "name": "dungeon", "description": "Open or view a party expedition against a miniboss (2-4 heroes)",
+    { "name": "dungeon", "description": "Open or view a party expedition against a miniboss (2-4 heroes, level 3+, 2h cooldown)",
       "options": [
         { "name": "target", "description": "Which dungeon to open (omit for the best fit)", "type": 3, "required": false }
       ] },
@@ -59,7 +59,7 @@
         { "name": "price", "description": "Asking price in Embers (0 = gift)", "type": 4, "required": true },
         { "name": "qty", "description": "How many (default 1)", "type": 4, "required": false }
       ] },
-    { "name": "guild", "description": "Found, join, or inspect a guild",
+    { "name": "guild", "description": "Found (2,500 Embers), join, or inspect a guild",
       "options": [
         { "name": "action", "description": "create, join, leave, or info", "type": 3, "required": true },
         { "name": "name", "description": "Guild name (for create/join/info)", "type": 3, "required": false }

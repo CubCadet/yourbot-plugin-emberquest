@@ -1,6 +1,40 @@
 # Changelog
 
-## 0.4.1 — Live-host fixes (2026-06-12)
+## 0.4.2 — Full-system regression audit (2026-06-12)
+
+A seven-lens adversarial regression audit (49 agents, every finding skeptically
+verified) confirmed 42 issues across all four phases — all fixed:
+
+- **Coinflip is now debit-first** (blocker): the old shape credited wins against
+  a stale balance and cancelled losses penalty-free when the guarded debit
+  failed — positive expected value under concurrent commands. The stake now
+  leaves the balance before the coin is in the air.
+- **Compensation is exactly-once**: inline escrow refunds set a `compensated`
+  flag so an ambiguous refund RPC (which may have committed) is never paid a
+  second time by the outer error wall (duels, trades, guild founding).
+- **Terminal flips land before value moves** (duels, trades, dungeons): a crash
+  mid-settlement now burns instead of letting the stuck-'resolving' sweep
+  refund escrow that was already paid out.
+- Dungeon ambiguous-open now re-reads ownership before releasing the
+  server-wide lobby lock; pet hatches honor the epoch-guarded grant result;
+  duplicate-pet conversion is a `qty > 1` CAS (concurrent hatches can no longer
+  destroy the companion); unstrap fallbacks prove ownership in-statement; the
+  Rekindle wipe is retried and walled, and the spared companion survives as
+  exactly one copy.
+- Arena payouts run after the interaction response (3s window), the
+  UTC-midnight entry race unwinds itself with a refund, and result broadcasts
+  count all entrants. Dungeons/rosters are pruned; guild member counts
+  self-reconcile.
+- Copy & docs: "the the <place>" doubled article fixed; cache odds are
+  reachable anytime (📊 button + `/open item:odds`); onboarding, perk labels,
+  manifest descriptions, README counts/version, and changelog dates corrected.
+- Test net expanded to 181 tests: component-dispatch coverage for all 16
+  button prefixes, ambiguity ownership re-reads, earned-income epoch
+  survivals, quest hooks driven through their host commands, lock self-heal
+  age branch and pruning, dashboard drift guard, and a stricter FakeSql that
+  mirrors the host's error contract for all sqlite errors.
+
+## 0.4.1 — Live-host fixes (2026-06-11)
 
 First production deploy surfaced two host behaviors the SDK doesn't document:
 
@@ -15,7 +49,7 @@ First production deploy surfaced two host behaviors the SDK doesn't document:
 - A regression meta-test scans every shipped SQL literal against the host's statement-type
   allowlist so this class of rejection can't return.
 
-## 0.4.0 — Phase 4: Progression & flavor (2026-06-12)
+## 0.4.0 — Phase 4: Progression & flavor (2026-06-11)
 
 - **Companions** (`/pet`): five pets with distinct passive perks, hatched from caches,
   tradeable; the active companion's perk suspends while it sits in trade escrow.

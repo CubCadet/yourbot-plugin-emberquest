@@ -56,22 +56,29 @@ class FakeSql:
             return 0
         try:
             cur = self._conn.execute(translated, params or [])
-        except sqlite3.IntegrityError as exc:
-            # The real transport surfaces host SQL errors as RuntimeError
-            # ("RPC error (sql.execute): …") — mirror that contract.
+        except sqlite3.Error as exc:
+            # The real transport surfaces EVERY host SQL error as RuntimeError
+            # ("RPC error (sql.execute): …") — mirror that contract so the
+            # plugin's (SdkError, RuntimeError) walls see the same class.
             raise RuntimeError(f"RPC error (sql.execute): {exc}") from exc
         self._conn.commit()
         return cur.rowcount
 
     def query(self, sql, params=None, *, limit=1000):
         self.executed.append({"sql": sql, "params": params, "limit": limit})
-        cur = self._conn.execute(self._translate(sql), params or [])
+        try:
+            cur = self._conn.execute(self._translate(sql), params or [])
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"RPC error (sql.query): {exc}") from exc
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchmany(limit)]
 
     def query_one(self, sql, params=None):
         self.executed.append({"sql": sql, "params": params})
-        cur = self._conn.execute(self._translate(sql), params or [])
+        try:
+            cur = self._conn.execute(self._translate(sql), params or [])
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"RPC error (sql.query_one): {exc}") from exc
         row = cur.fetchone()
         if row is None:
             return None
@@ -1661,23 +1668,31 @@ def test_trade_away_equipped_gear_unstraps_it(world):
     assert "unstrap" in text_of(last(world.ctx))
 
 
-def test_trade_settlement_failure_voids_and_refunds(world, monkeypatch):
+def test_trade_settlement_failure_burns_not_mints(world, monkeypatch):
+    # Burn-bias contract: the terminal flip lands BEFORE the grant, so an
+    # ambiguous grant failure can never refund escrow for goods that may have
+    # been delivered. The failure burns — no value is duplicated anywhere.
     trade_setup(world, qty=2, price=100)
     real_add_item = handlers._add_item
 
     def explode_for_buyer(ctx, user_id, item_id, amount=1, epoch=None):
-        if user_id == "300":  # the grant fails; the seller's refund still works
+        if user_id == "300":
             raise RuntimeError("RPC error (sql.execute): boom")
         return real_add_item(ctx, user_id, item_id, amount, epoch=epoch)
 
     monkeypatch.setattr(handlers, "_add_item", explode_for_buyer)
     handlers.comp_trade_accept(world.ctx, press(f"{handlers.TRADE_ACCEPT_PREFIX}trade1", uid="300"))
     assert "went wrong" in text_of(last(world.ctx))
-    assert get_player(world, "300")["coins"] == 150           # buyer refunded
-    assert item_qty(world, game.LIFE_POTION, "300") == 0
     row = world.conn.execute("SELECT status FROM trades WHERE id = 'trade1'").fetchone()
-    assert row[0] == "expired"                                # never wedged
-    assert item_qty(world, game.LIFE_POTION) == 3             # escrow went home
+    assert row[0] == "resolved"                               # closed, never wedged
+    assert get_player(world, "300")["coins"] == 50            # buyer paid (burn-bias)
+    assert item_qty(world, game.LIFE_POTION, "300") == 0      # goods burned, not duped
+    assert item_qty(world, game.LIFE_POTION) == 1             # escrow NOT re-minted
+    assert get_player(world)["coins"] == 100                  # seller credit still landed
+    # a later sweep must not resurrect anything either
+    world.clock.advance(game.TRADE_TTL + 700)
+    handlers._sweep_stale_trades(world.ctx, int(world.clock.now()))
+    assert item_qty(world, game.LIFE_POTION) == 1
 
 
 def test_social_tables_are_pruned(world):
@@ -2470,6 +2485,11 @@ def test_custom_ids_fit_discord_limit():
                 f"{handlers.TRADE_DECLINE_PREFIX}{snowflake}",
                 f"{handlers.TRADE_CANCEL_PREFIX}{snowflake}",
                 f"{handlers.ARENA_JOIN_PREFIX}2026-06-11",
+                f"{handlers.LOOT_ODDS_PREFIX}{snowflake}",
+                # production fallback ids are "<uid>-<epoch>" (31 chars)
+                f"{handlers.DUNGEON_JOIN_PREFIX}{snowflake}-1781204440",
+                f"{handlers.TRADE_CANCEL_PREFIX}{snowflake}-1781204440",
+                f"{handlers.DUEL_ACCEPT_PREFIX}{snowflake}-1781204440",
                 f"{handlers.QUEST_CLAIM_PREFIX}2:{snowflake}",
                 f"{handlers.REKINDLE_CONFIRM_PREFIX}{snowflake}",
                 f"{handlers.LOOT_AGAIN_PREFIX}blazing_cache:{snowflake}",
@@ -2540,3 +2560,293 @@ def test_handler_errors_are_walled(world, monkeypatch):
     response = last(world.ctx)
     assert response["ephemeral"] is True and "went wrong" in text_of(response)
     assert any(e["level"] == "error" for e in world.ctx.log_entries)
+
+
+# --- Regression-audit additions: dispatch, ambiguity, epoch survivals, hooks ---
+
+def test_component_dispatch_through_registered_filters_all_prefixes(world):
+    """Every component prefix must be wired into the interaction registry and
+    produce exactly one response when dispatched — even if it's a rejection."""
+    registry = handlers.plugin._event_handlers["interaction_create"]
+    started(world)
+    cases = [
+        f"{handlers.HUNT_AGAIN_PREFIX}{UID}",
+        f"{handlers.HEAL_PREFIX}{UID}",
+        f"{handlers.SHOP_PAGE_PREFIX}1:{UID}",
+        f"{handlers.DUNGEON_JOIN_PREFIX}nope",
+        f"{handlers.DUNGEON_BEGIN_PREFIX}nope",
+        f"{handlers.CRAFT_PREFIX}{game.LIFE_POTION}:{UID}",
+        f"{handlers.DUEL_ACCEPT_PREFIX}nope",
+        f"{handlers.DUEL_DECLINE_PREFIX}nope",
+        f"{handlers.TRADE_ACCEPT_PREFIX}nope",
+        f"{handlers.TRADE_DECLINE_PREFIX}nope",
+        f"{handlers.TRADE_CANCEL_PREFIX}nope",
+        f"{handlers.ARENA_JOIN_PREFIX}1969-01-01",
+        f"{handlers.QUEST_CLAIM_PREFIX}0:{UID}",
+        f"{handlers.REKINDLE_CONFIRM_PREFIX}{UID}",
+        f"{handlers.LOOT_AGAIN_PREFIX}ember_cache:{UID}",
+        f"{handlers.LOOT_ODDS_PREFIX}{UID}",
+        f"{handlers.PET_SET_PREFIX}cinderpup:{UID}",
+    ]
+    for custom_id in cases:
+        ctx = world.make_ctx()
+        event = press(custom_id)
+        for wrapped in registry:
+            wrapped(ctx, event)
+        assert len(ctx.interaction.responses) == 1, custom_id
+
+
+def test_duel_open_ambiguity_reread_keeps_committed_challenge(world, monkeypatch):
+    """If the open INSERT raises but actually committed, the challenge must be
+    kept (no refund — a later expiry would otherwise pay the stake twice)."""
+    started(world)
+    ready_hero(world, "300")
+    set_player(world, coins=100)
+    real_execute = world.ctx.sql.execute
+
+    def ambiguous(sql, params=None):
+        result = real_execute(sql, params)
+        if sql.startswith("INSERT INTO duels"):
+            raise RuntimeError("RPC error (sql.execute): timeout after commit")
+        return result
+
+    monkeypatch.setattr(world.ctx.sql, "execute", ambiguous)
+    handlers.cmd_duel(world.ctx, slash(
+        "duel", options=[{"name": "user", "value": "300"}, {"name": "bet", "value": 60}],
+        interaction_id="amb-d"))
+    row = world.conn.execute("SELECT status FROM duels WHERE id = 'amb-d'").fetchone()
+    assert row[0] == "open"                      # challenge kept
+    assert get_player(world)["coins"] == 40      # stake stays escrowed, no refund
+    assert "challenges" in text_of(last(world.ctx))
+    lock = world.conn.execute(
+        "SELECT ref FROM locks WHERE name = ?", [f"duel:{UID}"]).fetchone()
+    assert lock[0] == "amb-d"                    # lock still held by the live row
+
+
+def test_duel_open_ambiguity_reread_rejects_foreign_row(world, monkeypatch):
+    """If the re-read finds a row with the SAME id but a DIFFERENT owner (id
+    collision), it must refund and never claim someone else's challenge."""
+    started(world)
+    ready_hero(world, "300")
+    set_player(world, coins=100)
+    world.conn.execute(
+        "INSERT INTO duels (id, challenger_id, target_id, challenger_name, bet, "
+        "status, created_at, epoch) VALUES ('amb-f', '999', '300', 'Else', 5, "
+        "'open', ?, 0)", [int(world.clock.now())])
+    world.conn.commit()
+    real_execute = world.ctx.sql.execute
+
+    def ambiguous(sql, params=None):
+        if sql.startswith("INSERT INTO duels"):
+            raise RuntimeError("RPC error (sql.execute): boom")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(world.ctx.sql, "execute", ambiguous)
+    handlers.cmd_duel(world.ctx, slash(
+        "duel", options=[{"name": "user", "value": "300"}, {"name": "bet", "value": 60}],
+        interaction_id="amb-f"))
+    assert get_player(world)["coins"] == 100     # refunded, nothing claimed
+    assert "flames shifted" in text_of(last(world.ctx))
+
+
+def test_earned_income_survives_rekindle_by_design(world):
+    """Arena prizes and completed-quest claims are income already earned —
+    both deliberately cross the epoch boundary (documented on the confirm)."""
+    # quest claim after rekindle
+    started(world)
+    set_player(world, level=22, coins=0)
+    day = game.arena_day(int(world.clock.now()))
+    quest = game.daily_quests(UID, day)[0]
+    for _ in range(quest["target"]):
+        handlers._quest_event(world.ctx, UID, quest["key"], int(world.clock.now()))
+    handlers.cmd_rekindle(world.ctx, slash("rekindle"))
+    handlers.comp_rekindle_confirm(world.ctx, press(f"{handlers.REKINDLE_CONFIRM_PREFIX}{UID}"))
+    assert get_player(world)["rekindles"] == 1 and get_player(world)["coins"] == 0
+    handlers.comp_quest_claim(world.ctx, press(f"{handlers.QUEST_CLAIM_PREFIX}0:{UID}"))
+    expected = game.quest_reward(quest, 1, game.player_boosts("", 1, None))
+    assert get_player(world)["coins"] == expected  # claim pays at the NEW epoch
+
+    # arena prize paid out to a since-rekindled entrant
+    ready_hero(world, "A1", level=22, name="Aria")
+    yesterday = game.arena_day(int(world.clock.now()))
+    world.conn.execute(
+        "INSERT INTO arena_entries (day, user_id, username, score, paid_fee, "
+        "channel_id, created_at) VALUES (?, 'A1', 'Aria', 42, ?, '1', ?)",
+        [yesterday, game.ARENA_FEE, int(world.clock.now())])
+    world.conn.execute("UPDATE players SET rekindles = 1 WHERE user_id = 'A1'")
+    world.conn.commit()
+    world.clock.advance(86400)
+    started(world)  # idempotent; gives the sweep a caller
+    set_player(world, coins=100)
+    handlers.cmd_arena(world.ctx, slash("arena"))
+    # pool = 1×50 fee + 100 bonus = 150 → 1st place 50% = 75, paid to the
+    # rekindled (epoch 1) character: earned income crosses the burn by design
+    assert get_player(world, "A1")["coins"] == 75
+
+
+def test_quest_hooks_fire_through_host_commands(world):
+    """Drive each hook through its real host command for a hero whose daily
+    board contains that key, then assert the progress row ticked."""
+    now = int(world.clock.now())
+    day = game.arena_day(now)
+
+    def uid_with(key, start=2000):
+        return next(str(n) for n in range(start, start + 400)
+                    if key in [q["key"] for q in game.daily_quests(str(n), day)])
+
+    def progress(uid, key):
+        idx = [q["key"] for q in game.daily_quests(uid, day)].index(key)
+        row = world.conn.execute(
+            "SELECT progress FROM quest_progress WHERE user_id = ? AND day = ? "
+            "AND quest_idx = ?", [uid, day, idx]).fetchone()
+        return row[0] if row else 0
+
+    # hunt_win
+    uid = uid_with("hunt_win")
+    ready_hero(world, uid, level=1)
+    handlers.cmd_hunt(world.ctx, slash("hunt", uid=uid))
+    assert progress(uid, "hunt_win") == 1
+    # adventure_win
+    uid = uid_with("adventure_win")
+    ready_hero(world, uid, level=1)
+    handlers.cmd_adventure(world.ctx, slash("adventure", uid=uid))
+    assert progress(uid, "adventure_win") == 1
+    # heal (auto-buy path)
+    uid = uid_with("heal")
+    ready_hero(world, uid, level=1)
+    set_player(world, uid=uid, hp=40, coins=100, last_action_at=now)
+    handlers.cmd_heal(world.ctx, slash("heal", uid=uid))
+    assert progress(uid, "heal") == 1
+    # craft
+    uid = uid_with("craft")
+    ready_hero(world, uid, level=1)
+    set_player(world, uid=uid, coins=100)
+    give_items(world, uid, ember_shard=1)
+    handlers.cmd_craft(world.ctx, slash("craft", uid=uid,
+                                        options=[{"name": "item", "value": "ember tonic"}]))
+    assert progress(uid, "craft") == 1
+    # coinflip
+    uid = uid_with("coinflip")
+    ready_hero(world, uid, level=1)
+    set_player(world, uid=uid, coins=100)
+    handlers.cmd_coinflip(world.ctx, slash("coinflip", uid=uid,
+                                           options=[{"name": "bet", "value": 10}]))
+    assert progress(uid, "coinflip") == 1
+    # arena
+    uid = uid_with("arena")
+    ready_hero(world, uid, level=1)
+    set_player(world, uid=uid, coins=100)
+    handlers.cmd_arena(world.ctx, slash("arena", uid=uid))
+    assert progress(uid, "arena") == 1
+    # duel — both fighters tick; pick a challenger whose board has it
+    uid = uid_with("duel")
+    ready_hero(world, uid, level=1)
+    ready_hero(world, "9901", level=1)
+    set_player(world, uid=uid, coins=50)
+    set_player(world, uid="9901", coins=50)
+    handlers.cmd_duel(world.ctx, slash(
+        "duel", uid=uid, options=[{"name": "user", "value": "9901"}],
+        interaction_id=f"qd-{uid}"))
+    handlers.comp_duel_accept(world.ctx, press(f"{handlers.DUEL_ACCEPT_PREFIX}qd-{uid}", uid="9901"))
+    assert progress(uid, "duel") == 1
+    # dungeon — resolve a two-hero expedition including the tracked hero
+    uid = uid_with("dungeon")
+    ready_hero(world, uid, level=3)
+    ready_hero(world, "9902", level=3)
+    handlers.cmd_dungeon(world.ctx, slash("dungeon", uid=uid, interaction_id=f"qg-{uid}"))
+    handlers.comp_dungeon_join(world.ctx, press(f"{handlers.DUNGEON_JOIN_PREFIX}qg-{uid}", uid="9902"))
+    handlers.comp_dungeon_begin(world.ctx, press(f"{handlers.DUNGEON_BEGIN_PREFIX}qg-{uid}", uid=uid))
+    assert progress(uid, "dungeon") == 1
+
+
+def test_lock_self_heal_age_branch_and_prune(world):
+    now = int(world.clock.now())
+    # a lock whose holder row is still 'open' but far beyond the domain TTL
+    # is breakable via the age branch
+    world.conn.execute(
+        "INSERT INTO duels (id, challenger_id, target_id, bet, status, created_at, epoch) "
+        "VALUES ('aged', '1', '2', 0, 'open', ?, 0)", [now])
+    world.conn.execute(
+        "INSERT INTO locks (name, ref, created_at) VALUES ('duel:1', 'aged', ?)",
+        [now - game.DUEL_TTL - 700])
+    world.conn.commit()
+    assert handlers._acquire_lock(world.ctx, "duel", "duel:1", "newref", now) is True
+    # ancient lock rows are pruned by the duel sweep
+    world.conn.execute(
+        "INSERT INTO locks (name, ref, created_at) VALUES ('trade:dead', 'x', ?)",
+        [now - 8 * 86400])
+    world.conn.commit()
+    handlers._sweep_stale_duels(world.ctx, now)
+    assert world.conn.execute(
+        "SELECT COUNT(*) FROM locks WHERE name = 'trade:dead'").fetchone()[0] == 0
+
+
+def test_craft_shortage_refund_burns_across_epoch(world, monkeypatch):
+    """The shortage refund runs with the epoch captured at _begin: a Rekindle
+    landing mid-craft burns the fee instead of resurrecting it."""
+    started(world)
+    set_player(world, coins=200)
+    give_items(world, UID, ember_shard=2)  # phoenix draught also needs wraithsilk
+    real_take = handlers._take_item
+
+    def take_then_rekindle(ctx, user_id, item_id):
+        world.conn.execute("UPDATE players SET rekindles = 1, coins = 0 WHERE user_id = ?",
+                           [UID])
+        world.conn.commit()
+        return real_take(ctx, user_id, item_id)
+
+    monkeypatch.setattr(handlers, "_take_item", take_then_rekindle)
+    handlers.cmd_craft(world.ctx, slash("craft",
+                                        options=[{"name": "item", "value": "Phoenix Draught"}]))
+    assert "Missing materials" in text_of(last(world.ctx))
+    assert get_player(world)["coins"] == 0          # fee refund burned (epoch 0 != 1)
+
+
+def test_dashboard_phase_cards_and_drift_guard(world):
+    params = {"discord_srv_id": "999"}
+    for handler in (handlers.dash_dungeons_cleared, handlers.dash_duels_fought,
+                    handlers.dash_caches_opened):
+        out = handler(world.ctx, params)
+        assert isinstance(out["value"], int) and "change" in out
+    # the committed dashboard JSON must match what the generator produces
+    import runpy
+    before = (ROOT / "dashboard_manifest.json").read_text()
+    runpy.run_path(str(ROOT / "tests" / "gen_dashboard.py"))
+    after = (ROOT / "dashboard_manifest.json").read_text()
+    assert before == after, "dashboard_manifest.json drifted from its generator"
+
+
+def test_open_odds_button_and_arg(world):
+    started(world)
+    give_items(world, UID, ember_cache=1)
+    handlers.cmd_open(world.ctx, slash("open", options=[{"name": "item", "value": "odds"}]))
+    assert "what's inside?" in text_of(last(world.ctx))   # odds WITHOUT spending
+    assert item_qty(world, "ember_cache") == 1
+    handlers.cmd_open(world.ctx, slash("open"))
+    buttons = last(world.ctx)["components"][0].to_dict()["components"]
+    odds_id = f"{handlers.LOOT_ODDS_PREFIX}{UID}"
+    assert any(b["custom_id"] == odds_id for b in buttons)
+    handlers.comp_loot_odds(world.ctx, press(odds_id, uid="999"))
+    assert "your own odds" in text_of(last(world.ctx))
+    handlers.comp_loot_odds(world.ctx, press(odds_id))
+    assert "JACKPOT" in text_of(last(world.ctx))
+
+
+def test_adventure_copy_has_no_doubled_article(world):
+    started(world)
+    handlers.cmd_adventure(world.ctx, slash("adventure"))
+    body = text_of(last(world.ctx))
+    assert "the the" not in body.lower()
+    assert "the Smoldering Fen" in body
+
+
+def test_coinflip_is_debit_first(world):
+    """The stake must leave the balance even when the flip is a win — the
+    recorder shows debit-then-credit, never credit-only."""
+    started(world)
+    set_player(world, coins=100)
+    handlers.cmd_coinflip(world.ctx, slash("coinflip", options=[{"name": "bet", "value": 60}]))
+    flips = [e for e in world.ctx.sql.executed
+             if isinstance(e.get("sql"), str) and "coins = coins" in e["sql"]]
+    assert any("coins - " in e["sql"] for e in flips), "no debit recorded"
+    assert get_player(world)["coins"] == 160  # ScriptRng(0.0) wins: 100-60+120
