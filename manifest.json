@@ -1,7 +1,7 @@
 {
   "id": "emberquest",
   "name": "EmberQuest",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "An original Discord RPG set in the Cinderwilds — hunt ash-born monsters, raid dungeon minibosses with your party, duel rivals, trade with friends, found guilds, fight in the daily arena, hatch companions from Ember Caches, clear daily quests, chase seasonal events, and Rekindle your legend for permanent bonuses. Embers are virtual currency with no real-world value. Includes an admin dashboard with live stats and a tunable economy.",
   "author": "EmberStream Studio",
   "tags": ["rpg", "economy", "game", "fun"],

@@ -55,6 +55,7 @@ PET_SET_PREFIX = "v1:pet:set:"
 
 KV_MULTIPLIER = "economy_multiplier"
 KV_CHANNEL = "allowed_channel_id"
+KV_SCHEMA_REV = "schema_rev"
 
 COMMAND_NAMES = [
     "start", "profile", "hunt", "adventure", "heal", "inventory",
@@ -74,6 +75,12 @@ def _now() -> int:
 # --- Schema & lifecycle ------------------------------------------------------
 
 _SCHEMA = (
+    # ORDER MATTERS: the live host rate-limits schema changes ("DDL rate
+    # limit: max 5 DDL statements per hour", verified in production), so a
+    # fresh install provisions over several hourly windows. Tables are listed
+    # by gameplay priority: the core loop (players/inventory), quest
+    # bookkeeping (hunts tick quests passively), and the locks table (which
+    # gates duels/trades/dungeons) land in the first window.
     "CREATE TABLE IF NOT EXISTS players ("
     "  user_id           TEXT PRIMARY KEY,"
     "  username          TEXT NOT NULL DEFAULT '',"
@@ -100,6 +107,24 @@ _SCHEMA = (
     "  item_id TEXT NOT NULL,"
     "  qty     INT NOT NULL DEFAULT 0,"
     "  PRIMARY KEY (user_id, item_id))",
+    # Daily quest progress. The quest LIST is derived deterministically from
+    # (day, user_id) — only counters and claim flags need storage.
+    "CREATE TABLE IF NOT EXISTS quest_progress ("
+    "  user_id   TEXT NOT NULL,"
+    "  day       TEXT NOT NULL,"
+    "  quest_idx INT NOT NULL,"
+    "  progress  INT NOT NULL DEFAULT 0,"
+    "  claimed   INT NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (user_id, day, quest_idx))",
+    # One-open invariants (one dungeon lobby per server, one live challenge
+    # per challenger, one live offer per seller) ride this table's PRIMARY
+    # KEY: an INSERT ... ON CONFLICT DO NOTHING is an atomic insert-once
+    # claim, judged by rowcount — the allowlist-legal replacement for the
+    # partial unique indexes the host refuses.
+    "CREATE TABLE IF NOT EXISTS locks ("
+    "  name       TEXT PRIMARY KEY,"
+    "  ref        TEXT NOT NULL,"
+    "  created_at BIGINT NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS dungeons ("
     "  id           TEXT PRIMARY KEY,"
     "  dungeon_key  TEXT NOT NULL,"
@@ -166,24 +191,6 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS arena_days ("
     "  day         TEXT PRIMARY KEY,"
     "  resolved_at BIGINT NOT NULL DEFAULT 0)",
-    # Daily quest progress. The quest LIST is derived deterministically from
-    # (day, user_id) — only counters and claim flags need storage.
-    "CREATE TABLE IF NOT EXISTS quest_progress ("
-    "  user_id   TEXT NOT NULL,"
-    "  day       TEXT NOT NULL,"
-    "  quest_idx INT NOT NULL,"
-    "  progress  INT NOT NULL DEFAULT 0,"
-    "  claimed   INT NOT NULL DEFAULT 0,"
-    "  PRIMARY KEY (user_id, day, quest_idx))",
-    # One-open invariants (one dungeon lobby per server, one live challenge
-    # per challenger, one live offer per seller) ride this table's PRIMARY
-    # KEY: an INSERT ... ON CONFLICT DO NOTHING is an atomic insert-once
-    # claim, judged by rowcount — the allowlist-legal replacement for the
-    # partial unique indexes the host refuses.
-    "CREATE TABLE IF NOT EXISTS locks ("
-    "  name       TEXT PRIMARY KEY,"
-    "  ref        TEXT NOT NULL,"
-    "  created_at BIGINT NOT NULL DEFAULT 0)",
 )
 
 # Upgrades for servers that installed the Phase-1 schema. New installs get the
@@ -200,16 +207,64 @@ _MIGRATIONS = (
 )
 
 
-def _ensure_schema(ctx):
-    # EVERY statement is individually walled: one host rejection must never
-    # block the tables after it (a single failure once left half the schema
-    # uncreated in production).
+_SCHEMA_REV = 2          # bump whenever _SCHEMA or _MIGRATIONS change
+_SCHEMA_RETRY_SECONDS = 660  # the host's DDL budget refills hourly; poll a
+                             # little faster so we catch the refill promptly
+_schema_ok: set = set()      # server ids whose schema rev is confirmed
+_schema_retry: dict = {}     # server id -> earliest next bootstrap attempt
+
+
+def _ensure_schema(ctx, server_id=""):
+    """Rate-limit-aware bootstrap.
+
+    The live host caps schema changes ("DDL rate limit: max 5 DDL statements
+    per hour"), so a fresh install cannot land all its tables in one go. Every
+    statement is individually walled (one rejection must never block the
+    tables after it), a KV revision marker makes fully-provisioned servers
+    boot with ZERO DDL, and incomplete bootstraps are retried periodically
+    from _begin until every statement has landed.
+    """
+    if server_id and server_id in _schema_ok:
+        return True
+    try:
+        if int(ctx.kv.get(KV_SCHEMA_REV) or 0) >= _SCHEMA_REV:
+            if server_id:
+                _schema_ok.add(server_id)
+            return True
+    except (SdkError, RuntimeError, TypeError, ValueError):
+        pass  # KV hiccup or junk value: fall through to the walled DDL
+    failures = 0
     for ddl in _SCHEMA + _MIGRATIONS:
         try:
             ctx.sql.execute(ddl)
         except (SdkError, RuntimeError) as exc:
+            failures += 1
             ctx.log("EmberQuest schema statement skipped: " + str(exc),
                     level="warning")
+    if failures:
+        ctx.log("EmberQuest schema incomplete: " + str(failures) + " statements "
+                "deferred by the host's hourly DDL budget; retrying periodically. "
+                "Features touching missing tables will say the Cinderwilds are "
+                "still settling in.", level="warning")
+        return False
+    _quietly(ctx.kv.set, KV_SCHEMA_REV, _SCHEMA_REV)
+    if server_id:
+        _schema_ok.add(server_id)
+    return True
+
+
+def _maybe_retry_schema(ctx, event):
+    """Cheap per-command check: while a server's schema is incomplete, retry
+    the bootstrap every ~11 minutes so the hourly DDL budget refill is picked
+    up without waiting for a process restart."""
+    sid = str(event.get("guild_id") or "")
+    if sid in _schema_ok:
+        return
+    now = _now()
+    if now < _schema_retry.get(sid, 0):
+        return
+    _schema_retry[sid] = now + _SCHEMA_RETRY_SECONDS
+    _ensure_schema(ctx, sid)
 
 
 @plugin.on_install
@@ -642,7 +697,16 @@ def _safe(fn):
         except (SdkError, RuntimeError) as exc:
             ctx.log("EmberQuest handler error: " + str(exc), level="error",
                     request_id=ctx.request_id)
-            _try_respond(ctx, "🔥 Something went wrong in the Cinderwilds — please try again.")
+            missing_relation = ("does not exist" in str(exc)        # postgres
+                                or "no such table" in str(exc))     # sqlite (tests)
+            if missing_relation:
+                # A table hasn't landed yet: fresh installs provision over a
+                # few hourly windows (the host rate-limits schema changes).
+                _try_respond(ctx, "🔥 The Cinderwilds are still settling in — a fresh "
+                                  "install raises its grounds over the first few hours. "
+                                  "This feature will light up shortly; try again soon.")
+            else:
+                _try_respond(ctx, "🔥 Something went wrong in the Cinderwilds — please try again.")
     return wrapper
 
 
@@ -701,6 +765,7 @@ def _begin(ctx, event, command, *, needs_player=True):
     Returns a state dict, or None if the command was already answered.
     """
     ctx.metrics.record("commands", tags={"command": command})
+    _maybe_retry_schema(ctx, event)
     multiplier, channel = _settings(ctx)
     if channel and str(event.get("channel_id") or "") != channel:
         _try_respond(ctx, f"🔥 EmberQuest lives in <#{channel}> on this server.")

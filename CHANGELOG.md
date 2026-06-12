@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.3 — DDL-rate-limit-aware bootstrap (2026-06-12)
+
+Second production deploy surfaced a third undocumented host limit: **"DDL rate
+limit: max 5 DDL statements per hour."** The 20-statement schema bootstrap
+could not finish in one window, leaving later tables (`quest_progress`,
+`arena_entries`, `arena_days`, `locks`) uncreated — `/quests` errored until
+enough hourly windows passed.
+
+- **Zero-DDL steady state**: a KV schema-revision marker is written once every
+  statement has landed; every boot after that issues no DDL at all, so routine
+  restarts can never burn the hourly budget.
+- **Priority-ordered provisioning**: tables are created in gameplay order —
+  the core loop (`players`, `inventory`), quest bookkeeping, and the `locks`
+  gate land in the first hourly window of a fresh install.
+- **In-process healing**: while a server's schema is incomplete, the bootstrap
+  retries every ~11 minutes from the command preamble, catching the budget
+  refill without waiting for a process restart.
+- **Honest UX while settling**: commands that hit a not-yet-created table now
+  explain that a fresh install raises its grounds over the first few hours,
+  instead of a generic error.
+
 ## 0.4.2 — Full-system regression audit (2026-06-12)
 
 A seven-lens adversarial regression audit (49 agents, every finding skeptically

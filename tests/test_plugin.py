@@ -113,6 +113,10 @@ class ScriptRng:
 def world(monkeypatch):
     conn = sqlite3.connect(":memory:")
     clock = MockClock(start=START_EPOCH)
+    # bootstrap caches are module-level (keyed by server id in production);
+    # each test world is a fresh database, so they must start empty
+    handlers._schema_ok.clear()
+    handlers._schema_retry.clear()
 
     def make_ctx(capabilities=None):
         ctx = MockContext(clock=clock, capabilities=capabilities)
@@ -2850,3 +2854,60 @@ def test_coinflip_is_debit_first(world):
              if isinstance(e.get("sql"), str) and "coins = coins" in e["sql"]]
     assert any("coins - " in e["sql"] for e in flips), "no debit recorded"
     assert get_player(world)["coins"] == 160  # ScriptRng(0.0) wins: 100-60+120
+
+
+# --- DDL rate limit (live host: "max 5 DDL statements per hour") --------------
+
+def test_bootstrap_marks_revision_and_goes_zero_ddl(world):
+    """A clean bootstrap records the schema revision in KV; every later boot
+    must issue ZERO DDL (steady-state starts can't burn the hourly budget)."""
+    assert world.ctx.kv.get(handlers.KV_SCHEMA_REV) == handlers._SCHEMA_REV
+    ctx2 = world.make_ctx()
+    # production KV is durable per (server, plugin) and shared across worker
+    # processes; MockContext KV is per-instance, so carry the marker over
+    ctx2.kv.set(handlers.KV_SCHEMA_REV, world.ctx.kv.get(handlers.KV_SCHEMA_REV))
+    handlers.on_ready(ctx2)
+    assert [e for e in ctx2.sql.executed
+            if str(e.get("sql", "")).startswith(("CREATE", "ALTER"))] == []
+
+
+def test_rate_limited_bootstrap_retries_and_heals(world, monkeypatch):
+    """Statements rejected by the DDL budget defer the revision marker; the
+    per-command retry re-runs the bootstrap after the window and heals."""
+    world.ctx.kv.delete(handlers.KV_SCHEMA_REV)
+    world.conn.execute("DROP TABLE quest_progress")
+    world.conn.commit()
+    real_execute = world.ctx.sql.execute
+    limited = {"on": True}
+
+    def rate_limited(sql, params=None):
+        if limited["on"] and sql.startswith("CREATE TABLE IF NOT EXISTS quest_progress"):
+            raise RuntimeError("RPC error (sql.execute): DDL rate limit: "
+                               "max 5 DDL statements per hour")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(world.ctx.sql, "execute", rate_limited)
+    assert handlers._ensure_schema(world.ctx, "srv1") is False
+    assert world.ctx.kv.get(handlers.KV_SCHEMA_REV) is None  # NOT marked done
+    assert "srv1" not in handlers._schema_ok
+
+    # while the table is missing, the user sees the settling-in message
+    started(world)
+    handlers.cmd_quests(world.ctx, slash("quests", guild_id="srv1"))
+    assert "still settling in" in text_of(last(world.ctx))
+
+    # the budget refills: the next command past the retry window heals it
+    limited["on"] = False
+    world.clock.advance(handlers._SCHEMA_RETRY_SECONDS + 1)
+    handlers.cmd_quests(world.ctx, slash("quests", guild_id="srv1"))
+    assert "Quest Board" in text_of(last(world.ctx))
+    assert world.ctx.kv.get(handlers.KV_SCHEMA_REV) == handlers._SCHEMA_REV
+    assert "srv1" in handlers._schema_ok
+
+
+def test_schema_orders_core_tables_into_first_ddl_window(world):
+    """Fresh installs land ~5 tables per hourly window: the core loop, quest
+    bookkeeping, and the locks gate must be in the first five statements."""
+    first_window = " ".join(handlers._SCHEMA[:5])
+    for table in ("players", "inventory", "quest_progress", "locks"):
+        assert "EXISTS " + table in first_window, table
