@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.4 — Probe-gated bootstrap (2026-06-12)
+
+The 0.4.3 healing worked in production (the four missing tables landed in the
+next hourly window and `/quests` lit up), but the same log proved that **no-op
+`ALTER` statements also count against the host's 5/hour DDL budget** — which
+made 0.4.3's zero-DDL marker unreachable: it required all 20 statements to
+succeed in one pass, and the 8 unconditional ALTERs could never fit the budget.
+
+- **Existence probes**: every DDL statement is now paired with a cheap `SELECT`
+  probe; a successful probe proves the statement is a no-op and it is never
+  sent. The hourly budget is spent only on DDL that actually changes something.
+- A fully-provisioned server now reaches the zero-DDL marker on its **first
+  boot** — including servers upgrading from 0.4.2/0.4.3, with no waiting.
+- Fresh installs converge faster too: retries no longer re-spend budget
+  re-asserting what already landed.
+
 ## 0.4.3 — DDL-rate-limit-aware bootstrap (2026-06-12)
 
 Second production deploy surfaced a third undocumented host limit: **"DDL rate

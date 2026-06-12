@@ -2911,3 +2911,47 @@ def test_schema_orders_core_tables_into_first_ddl_window(world):
     first_window = " ".join(handlers._SCHEMA[:5])
     for table in ("players", "inventory", "quest_progress", "locks"):
         assert "EXISTS " + table in first_window, table
+
+
+def test_provisioned_server_reaches_marker_with_zero_ddl(world):
+    """The 0.4.3 flaw: no-op ALTERs count against the host's DDL budget, so a
+    marker that required all 20 statements to SUCCEED in one pass could never
+    be reached (8 ALTERs > 5/hour). Probes must prove no-ops instead: a fully
+    provisioned server with no marker sets it while issuing ZERO DDL."""
+    world.ctx.kv.delete(handlers.KV_SCHEMA_REV)
+    handlers._schema_ok.clear()
+    ctx2 = world.make_ctx()
+    assert handlers._ensure_schema(ctx2, "srv-up") is True
+    assert [e for e in ctx2.sql.executed
+            if str(e.get("sql", "")).startswith(("CREATE", "ALTER"))] == []
+    assert ctx2.kv.get(handlers.KV_SCHEMA_REV) == handlers._SCHEMA_REV
+    assert "srv-up" in handlers._schema_ok
+
+
+def test_probe_gating_issues_only_missing_ddl(world):
+    """Partial provisioning: only the statements whose probes fail are sent —
+    the hourly budget is never spent re-asserting what already exists."""
+    world.ctx.kv.delete(handlers.KV_SCHEMA_REV)
+    handlers._schema_ok.clear()
+    world.conn.execute("DROP TABLE locks")
+    world.conn.commit()
+    ctx2 = world.make_ctx()
+    assert handlers._ensure_schema(ctx2, "srv-p") is True
+    ddl = [str(e["sql"]) for e in ctx2.sql.executed
+           if str(e.get("sql", "")).startswith(("CREATE", "ALTER"))]
+    assert len(ddl) == 1 and "locks" in ddl[0]
+    assert world.conn.execute("SELECT COUNT(*) FROM locks").fetchone()[0] == 0
+    assert ctx2.kv.get(handlers.KV_SCHEMA_REV) == handlers._SCHEMA_REV
+
+
+def test_schema_probes_pair_with_their_ddl():
+    """Meta: every probe targets the relation its paired DDL creates/alters."""
+    assert len(handlers._SCHEMA) == len(handlers._SCHEMA_PROBES)
+    assert len(handlers._MIGRATIONS) == len(handlers._MIGRATION_PROBES)
+    for probe, ddl in zip(handlers._SCHEMA_PROBES, handlers._SCHEMA):
+        table = probe.split(" FROM ")[1].split(" ")[0]
+        assert "EXISTS " + table in ddl, (probe, ddl)
+    for probe, ddl in zip(handlers._MIGRATION_PROBES, handlers._MIGRATIONS):
+        column = probe.split("SELECT ")[1].split(" ")[0]
+        table = probe.split(" FROM ")[1].split(" ")[0]
+        assert "ALTER TABLE " + table in ddl and "EXISTS " + column in ddl, (probe, ddl)

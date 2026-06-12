@@ -155,7 +155,7 @@ root). Review turnaround is typically 1–3 business days.
 
 ## Versions
 
-See [CHANGELOG.md](CHANGELOG.md). Current: **0.4.3**.
+See [CHANGELOG.md](CHANGELOG.md). Current: **0.4.4**.
 
 ## License
 

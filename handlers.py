@@ -193,6 +193,24 @@ _SCHEMA = (
     "  resolved_at BIGINT NOT NULL DEFAULT 0)",
 )
 
+# Existence probes, paired 1:1 (in order) with _SCHEMA: a successful SELECT
+# proves the table exists, so its CREATE is never sent. SELECTs are free; the
+# host's hourly DDL budget is spent ONLY on statements that change something.
+_SCHEMA_PROBES = (
+    "SELECT user_id FROM players LIMIT 1",
+    "SELECT user_id FROM inventory LIMIT 1",
+    "SELECT user_id FROM quest_progress LIMIT 1",
+    "SELECT name FROM locks LIMIT 1",
+    "SELECT id FROM dungeons LIMIT 1",
+    "SELECT user_id FROM dungeon_members LIMIT 1",
+    "SELECT id FROM duels LIMIT 1",
+    "SELECT id FROM trades LIMIT 1",
+    "SELECT key FROM guilds LIMIT 1",
+    "SELECT user_id FROM guild_members LIMIT 1",
+    "SELECT user_id FROM arena_entries LIMIT 1",
+    "SELECT day FROM arena_days LIMIT 1",
+)
+
 # Upgrades for servers that installed the Phase-1 schema. New installs get the
 # columns from CREATE TABLE; these no-op there (IF NOT EXISTS).
 _MIGRATIONS = (
@@ -204,6 +222,22 @@ _MIGRATIONS = (
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS rekindles INT NOT NULL DEFAULT 0",
     "ALTER TABLE duels ADD COLUMN IF NOT EXISTS epoch INT NOT NULL DEFAULT 0",
     "ALTER TABLE trades ADD COLUMN IF NOT EXISTS epoch INT NOT NULL DEFAULT 0",
+)
+
+# Probes paired 1:1 (in order) with _MIGRATIONS: selecting the column proves
+# the ALTER is a no-op. Critical, not just an optimization — the host counts
+# no-op ALTERs against the DDL budget, so re-issuing all eight would both burn
+# the full hourly budget on every boot AND make a zero-failure bootstrap pass
+# (the condition for the KV revision marker) impossible.
+_MIGRATION_PROBES = (
+    "SELECT last_dungeon_at FROM players LIMIT 1",
+    "SELECT sword_enchant FROM players LIMIT 1",
+    "SELECT armor_enchant FROM players LIMIT 1",
+    "SELECT last_duel_at FROM players LIMIT 1",
+    "SELECT pet FROM players LIMIT 1",
+    "SELECT rekindles FROM players LIMIT 1",
+    "SELECT epoch FROM duels LIMIT 1",
+    "SELECT epoch FROM trades LIMIT 1",
 )
 
 
@@ -234,7 +268,15 @@ def _ensure_schema(ctx, server_id=""):
     except (SdkError, RuntimeError, TypeError, ValueError):
         pass  # KV hiccup or junk value: fall through to the walled DDL
     failures = 0
-    for ddl in _SCHEMA + _MIGRATIONS:
+    # strict zip: a probe/DDL length drift must fail loudly, never silently
+    # truncate trailing statements (which could set the marker incompletely).
+    for probe, ddl in zip(_SCHEMA_PROBES + _MIGRATION_PROBES,
+                          _SCHEMA + _MIGRATIONS, strict=True):
+        try:
+            ctx.sql.query_one(probe)
+            continue  # already provisioned — don't spend DDL budget on a no-op
+        except (SdkError, RuntimeError):
+            pass  # missing relation/column (or a transient): issue the DDL
         try:
             ctx.sql.execute(ddl)
         except (SdkError, RuntimeError) as exc:
