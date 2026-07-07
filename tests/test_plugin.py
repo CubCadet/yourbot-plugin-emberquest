@@ -932,7 +932,12 @@ def test_dungeon_join_open_to_all_then_dedupes(world):
     ready_hero(world, "300")
     handlers.comp_dungeon_join(world.ctx, press(f"{handlers.DUNGEON_JOIN_PREFIX}d1", uid="300"))
     confirm = last(world.ctx)
-    assert confirm["ephemeral"] is True and "2/4" in text_of(confirm)
+    # A non-final join now edits the shared public lobby card in place, so the
+    # roster/count update live for everyone (rather than an ephemeral note).
+    assert confirm["update_message"] is True
+    assert not confirm.get("ephemeral") and "2/4" in text_of(confirm)
+    ids = [c["custom_id"] for c in confirm["components"][0].to_dict()["components"]]
+    assert f"{handlers.DUNGEON_JOIN_PREFIX}d1" in ids  # Join / Sound-horn stay live
     broadcasts = world.ctx.discord.messages_sent
     assert broadcasts and "joined the expedition" in broadcasts[-1]["content"]
     handlers.comp_dungeon_join(world.ctx, press(f"{handlers.DUNGEON_JOIN_PREFIX}d1", uid="300"))
@@ -2955,3 +2960,186 @@ def test_schema_probes_pair_with_their_ddl():
         column = probe.split("SELECT ")[1].split(" ")[0]
         table = probe.split(" FROM ")[1].split(" ")[0]
         assert "ALTER TABLE " + table in ddl and "EXISTS " + column in ddl, (probe, ddl)
+
+
+# --- SDK 0.7+ in-place UX (respond(update_message=True)) + coverage gaps ------------------------
+# The pin moved to yourbot-sdk>=0.8.2, which unlocks respond(update_message=True):
+# component handlers now edit their attached card in place (stripping dead
+# buttons / refreshing lists) while slash commands still post fresh cards. These
+# tests pin that behavior, plus two previously-unasserted branches.
+
+def _in_place(response):
+    return response.get("update_message") is True
+
+
+def _buttons_cleared(response):
+    return not (response.get("components") or [])
+
+
+def test_profile_of_started_other_hero_renders(world):
+    started(world)
+    ready_hero(world, "300", level=4, name="Borin")
+    handlers.cmd_profile(world.ctx, slash("profile", options=[{"name": "user", "value": "300"}]))
+    body = text_of(last(world.ctx))
+    assert "Borin — Level 4" in body
+    assert "█" in body or "░" in body            # HP/XP bars rendered for the target
+    assert "Fists" in body                         # equipped gear shown
+
+
+def test_leaderboard_unknown_metric_falls_back_to_level(world):
+    _seed_heroes(world)
+    handlers.cmd_leaderboard(world.ctx, slash("leaderboard",
+                                              options=[{"name": "metric", "value": "banana"}]))
+    body = text_of(last(world.ctx))
+    assert "by level" in body                      # unrecognized metric coerced to level
+    assert body.index("**Borin**") < body.index("**Cinder**") < body.index("**Aria**")
+
+
+def test_shop_pagination_edits_in_place_slash_stays_fresh(world):
+    handlers.cmd_shop(world.ctx, slash("shop"))
+    assert not last(world.ctx).get("update_message")       # first /shop is a fresh card
+    handlers.comp_shop_page(world.ctx, press(f"{handlers.SHOP_PAGE_PREFIX}1:{UID}"))
+    turned = last(world.ctx)
+    assert turned["update_message"] is True and "Armor" in text_of(turned)
+
+
+def test_hunt_again_edits_combat_card_in_place(world):
+    started(world)
+    handlers.cmd_hunt(world.ctx, slash("hunt"))
+    assert not last(world.ctx).get("update_message")       # /hunt posts a fresh card
+    world.clock.advance(game.HUNT_COOLDOWN + 1)
+    handlers.comp_hunt_again(world.ctx, press(f"{handlers.HUNT_AGAIN_PREFIX}{UID}"))
+    refreshed = last(world.ctx)
+    assert refreshed["update_message"] is True              # the button refreshes it in place
+    # ...and the card body is genuinely re-rendered (not blanked): encounter
+    # stats plus the live "Hunt again" button are present.
+    assert "HP" in text_of(refreshed)
+    ids = [c["custom_id"] for c in refreshed["components"][0].to_dict()["components"]]
+    assert any(i.startswith(handlers.HUNT_AGAIN_PREFIX) for i in ids)
+
+
+def test_duel_settlement_rewrites_card_and_strips_buttons(world):
+    duel_setup(world, bet=50)
+    assert not last(world.ctx).get("update_message")       # challenge card carries live buttons
+    handlers.comp_duel_accept(world.ctx, press(f"{handlers.DUEL_ACCEPT_PREFIX}duel1", uid="300"))
+    settled = last(world.ctx)
+    assert "defeats" in text_of(settled)
+    assert _in_place(settled) and _buttons_cleared(settled)
+
+
+def test_duel_decline_strips_buttons(world):
+    duel_setup(world, bet=40)
+    handlers.comp_duel_decline(world.ctx, press(f"{handlers.DUEL_DECLINE_PREFIX}duel1", uid="300"))
+    declined = last(world.ctx)
+    assert "declined" in text_of(declined).lower()
+    assert _in_place(declined) and _buttons_cleared(declined)
+    assert get_player(world)["coins"] == 100               # escrow still refunded
+
+
+def test_trade_accept_rewrites_card_and_strips_buttons(world):
+    trade_setup(world)
+    handlers.comp_trade_accept(world.ctx, press(f"{handlers.TRADE_ACCEPT_PREFIX}trade1", uid="300"))
+    struck = last(world.ctx)
+    assert "Deal struck" in text_of(struck)
+    assert _in_place(struck) and _buttons_cleared(struck)
+
+
+def test_trade_decline_and_cancel_strip_buttons(world):
+    trade_setup(world)
+    handlers.comp_trade_decline(world.ctx, press(f"{handlers.TRADE_DECLINE_PREFIX}trade1", uid="300"))
+    declined = last(world.ctx)
+    assert _in_place(declined) and _buttons_cleared(declined)
+    assert item_qty(world, game.LIFE_POTION) == 3          # escrow still refunded
+    # a fresh offer, this time withdrawn by the seller
+    handlers.cmd_trade(world.ctx, slash(
+        "trade", options=[{"name": "user", "value": "300"},
+                          {"name": "item", "value": "ember tonic"},
+                          {"name": "price", "value": 10}], interaction_id="trade2"))
+    handlers.comp_trade_cancel(world.ctx, press(f"{handlers.TRADE_CANCEL_PREFIX}trade2", uid=UID))
+    cancelled = last(world.ctx)
+    assert _in_place(cancelled) and _buttons_cleared(cancelled)
+
+
+def test_loot_reroll_edits_card_in_place_slash_stays_fresh(world):
+    started(world)
+    give_items(world, UID, ember_cache=2)
+    handlers.cmd_open(world.ctx, slash("open"))
+    assert not last(world.ctx).get("update_message")       # /open posts a fresh card
+    handlers.comp_loot_again(world.ctx, press(f"{handlers.LOOT_AGAIN_PREFIX}ember_cache:{UID}"))
+    rerolled = last(world.ctx)
+    # a common (ephemeral) outcome refreshes the same card in place
+    assert rerolled["update_message"] is True and rerolled["ephemeral"] is True
+
+
+def test_craft_button_rerenders_recipe_list_in_place(world):
+    started(world)
+    give_items(world, UID, ember_shard=1)
+    set_player(world, coins=100)
+    handlers.comp_craft(world.ctx, press(f"{handlers.CRAFT_PREFIX}{game.LIFE_POTION}:{UID}"))
+    board = last(world.ctx)
+    assert item_qty(world, game.LIFE_POTION) == 1
+    assert board["update_message"] is True                 # recipe list refreshed in place
+    body = text_of(board)
+    assert "Forged" in body and "Crafting" in body         # forge banner + the list
+
+
+def test_pet_button_rerenders_list_in_place(world):
+    started(world)
+    give_items(world, UID, cinderpup=1, wisplight=1)
+    handlers.cmd_pet(world.ctx, slash("pet"))
+    assert not last(world.ctx).get("update_message")       # /pet posts a fresh list
+    handlers.comp_pet_set(world.ctx, press(f"{handlers.PET_SET_PREFIX}cinderpup:{UID}"))
+    board = last(world.ctx)
+    assert get_player(world)["pet"] == "cinderpup"
+    assert board["update_message"] is True
+    body = text_of(board)
+    assert "takes the lead" in body and "Companions" in body
+
+
+def test_quest_claim_rerenders_board_in_place(world):
+    started(world)
+    day = game.arena_day(int(world.clock.now()))
+    quest = game.daily_quests(UID, day)[0]
+    for _ in range(quest["target"]):
+        handlers._quest_event(world.ctx, UID, quest["key"], int(world.clock.now()))
+    handlers.cmd_quests(world.ctx, slash("quests"))
+    claim_id = f"{handlers.QUEST_CLAIM_PREFIX}0:{UID}"
+    handlers.comp_quest_claim(world.ctx, press(claim_id))
+    board = last(world.ctx)
+    assert board["update_message"] is True                 # board re-rendered in place
+    body = text_of(board)
+    assert "Claimed" in body and "Quest Board" in body     # payout banner + the board
+    remaining = ([c["custom_id"] for c in board["components"][0].to_dict()["components"]]
+                 if board.get("components") else [])
+    assert claim_id not in remaining                        # the claimed quest's button dropped
+
+
+def test_arena_midnight_toctou_counts_entry_and_never_mints(world, monkeypatch):
+    """A payout that settles the day in the instant our entry lands must not let
+    the fee be refunded on top (the entry was already counted): burn-bias holds."""
+    started(world)
+    set_player(world, coins=100)
+    today = game.arena_day(int(world.clock.now()))
+    real_execute = world.ctx.sql.execute
+
+    def racing_execute(sql, params=None):
+        rc = real_execute(sql, params)
+        # Simulate a concurrent settle claiming today the instant our guarded
+        # INSERT commits (arena_days appears AFTER, so our entry was counted).
+        if sql == handlers._ARENA_ENTER and rc:
+            world.conn.execute(
+                "INSERT INTO arena_days (day, resolved_at) VALUES (?, ?) "
+                "ON CONFLICT (day) DO NOTHING", [today, int(world.clock.now())])
+            world.conn.commit()
+        return rc
+
+    monkeypatch.setattr(world.ctx.sql, "execute", racing_execute)
+    handlers.cmd_arena(world.ctx, slash("arena"))
+    # The entry stands in the (now settled) tournament, counted...
+    assert world.conn.execute(
+        "SELECT COUNT(*) FROM arena_entries WHERE day = ? AND user_id = ?",
+        [today, UID]).fetchone()[0] == 1
+    # ...and the fee is NOT refunded on top — the old code deleted + refunded,
+    # which would have double-paid a podium finisher.
+    assert get_player(world)["coins"] == 100 - game.ARENA_FEE
+    assert "final results" in text_of(last(world.ctx))

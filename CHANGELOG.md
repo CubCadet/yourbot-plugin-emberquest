@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.5 — SDK 0.8.2 & in-place UX (2026-07-07)
+
+Upgraded to **yourbot-sdk 0.8.2** (from 0.6.1 — the pin was two minor generations
+behind). The delta is additive for everything EmberQuest uses (no SQL or API
+break), and the full suite plus `yourbot validate` pass on 0.8.2. The bump
+unlocks `respond(update_message=True)` (0.7.0), now used so component handlers
+edit their attached card in place instead of stacking a new one:
+
+- **Dead buttons cleared on settlement**: duel accept/decline and trade
+  accept/decline/cancel rewrite their challenge/offer card in place and strip the
+  now-inert Accept/Decline/Cancel buttons, so a resolved card can't be re-pressed.
+- **In-place refreshes**: shop pagination, "Hunt again", the loot "Open another"
+  reroll (common outcomes — jackpots and new companions still post a public
+  reveal), the `/pet` and `/craft` lists, and the `/quests` board now edit their
+  existing card rather than posting a fresh one per press. Slash-command
+  invocations still post a fresh card, and public broadcasts (dungeon joins,
+  jackpots, the Rekindle celebration) are unchanged.
+- **Live dungeon lobby**: joining an expedition re-renders the shared lobby
+  card's roster and Party (N/N) count in place, while still announcing the join
+  to the channel.
+
+Fixed a latent economy edge case surfaced by a tune-up audit:
+
+- **Arena UTC-midnight double-pay**: if a day's payout settled in the same instant
+  an entry landed, that entry could be both counted for a podium prize and
+  refunded its fee. Because `_ARENA_ENTER` is guarded against an already-settled
+  day, reaching the unwind branch proves the entry committed *before* the day was
+  claimed — so the settling payout already counted it. The entry now stands in the
+  settled tournament (no delete, no refund): burn-bias, never mint.
+
+Tests expanded to 200 (from 187): in-place / button-strip behavior across every
+converted handler, the arena double-pay guard, and two previously-unasserted
+branches (`/profile` of a started other hero, `/leaderboard` unknown-metric
+fallback).
+
 ## 0.4.4 — Probe-gated bootstrap (2026-06-12)
 
 The 0.4.3 healing worked in production (the four missing tables landed in the

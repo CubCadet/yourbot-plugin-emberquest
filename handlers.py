@@ -599,7 +599,6 @@ _ARENA_ENTER = ("INSERT INTO arena_entries (day, user_id, username, score, paid_
 # Insert-once claim: exactly one event pays out a finished day.
 _ARENA_CLAIM_DAY = ("INSERT INTO arena_days (day, resolved_at) VALUES (%s, %s) "
                     "ON CONFLICT (day) DO NOTHING")
-_DELETE_OWN_ARENA_ENTRY = "DELETE FROM arena_entries WHERE day = %s AND user_id = %s"
 _PRUNE_ARENA_ENTRIES = "DELETE FROM arena_entries WHERE day < %s"
 _PRUNE_ARENA_DAYS = "DELETE FROM arena_days WHERE day < %s"
 
@@ -1008,7 +1007,7 @@ def _loot_field(item_ids):
     return {"name": "Loot", "value": "\n".join(lines), "inline": True}
 
 
-def _do_hunt(ctx, event, state):
+def _do_hunt(ctx, event, state, *, update_message=False):
     now = _now()
     player = state["player"]
     if not _claim_cooldown(ctx, player, "hunt", "last_hunt_at", game.HUNT_COOLDOWN, now):
@@ -1025,10 +1024,10 @@ def _do_hunt(ctx, event, state):
         extra_fields = [_loot_field([result["drop"]])]
     if result["win"]:
         _quietly(_quest_event, ctx, player["user_id"], "hunt_win", now)
-    _finish_encounter(ctx, event, player, result, now, extra_fields)
+    _finish_encounter(ctx, event, player, result, now, extra_fields, update_message=update_message)
 
 
-def _finish_encounter(ctx, event, player, result, now, extra_fields=None):
+def _finish_encounter(ctx, event, player, result, now, extra_fields=None, *, update_message=False):
     """Apply an encounter result to the player row and respond with the embed."""
     new_xp = player["xp"] + result["xp_gain"]
     new_level = game.level_from_xp(new_xp)
@@ -1074,6 +1073,7 @@ def _finish_encounter(ctx, event, player, result, now, extra_fields=None):
     ctx.interaction.respond(
         embeds=[_embed(title, description, fields=fields)],
         components=_combat_buttons(player["user_id"], hp_after, new_max_hp),
+        update_message=update_message,
     )
 
 
@@ -1093,7 +1093,8 @@ def comp_hunt_again(ctx, event):
         return
     state = _begin(ctx, event, "hunt_again")
     if state is not None:
-        _do_hunt(ctx, event, state)
+        # Refresh the combat card in place instead of stacking a new one.
+        _do_hunt(ctx, event, state, update_message=True)
 
 
 @plugin.on_component(prefix=HEAL_PREFIX)
@@ -1223,7 +1224,7 @@ def cmd_inventory(ctx, event):
 
 # --- /shop + pagination ----------------------------------------------------------
 
-def _shop_response(ctx, page_index, user_id):
+def _shop_response(ctx, page_index, user_id, *, update_message=False):
     pages = game.shop_pages()
     page_index = max(0, min(len(pages) - 1, page_index))
     title, item_ids = pages[page_index]
@@ -1253,6 +1254,7 @@ def _shop_response(ctx, page_index, user_id):
         )],
         components=[ActionRow(*buttons)],
         ephemeral=True,
+        update_message=update_message,
     )
 
 
@@ -1279,7 +1281,9 @@ def comp_shop_page(ctx, event):
         page_index = int(page_str)
     except ValueError:
         page_index = 0
-    _shop_response(ctx, page_index, owner)
+    # Page turns edit the existing shop card in place (0.7.0+) instead of
+    # stacking a fresh ephemeral per Prev/Next press.
+    _shop_response(ctx, page_index, owner, update_message=True)
 
 
 # --- /buy & /sell ------------------------------------------------------------------
@@ -1613,7 +1617,7 @@ def _claim_player_dungeon_cooldown(ctx, user_id, now) -> bool:
                            [now, user_id, now - game.DUNGEON_COOLDOWN]) > 0
 
 
-def _lobby_response(ctx, lobby, members, now):
+def _lobby_response(ctx, lobby, members, now, *, update_message=False):
     dungeon = game.DUNGEONS[lobby["dungeon_key"]]
     roster = "\n".join(f"• **{m['username'] or 'Hero ' + str(m['user_id'])[-4:]}**"
                        for m in members) or "*No heroes yet.*"
@@ -1641,6 +1645,7 @@ def _lobby_response(ctx, lobby, members, now):
             Button("Sound the horn", f"{DUNGEON_BEGIN_PREFIX}{lobby['id']}",
                    style="danger", emoji="📯"),
         )],
+        update_message=update_message,
     )
 
 
@@ -1797,8 +1802,11 @@ def comp_dungeon_join(ctx, event):
             ctx.log("EmberQuest auto-begin failed post-respond: " + str(exc),
                     level="error", request_id=ctx.request_id)
     else:
-        _try_respond(ctx, f"🛡️ You join the expedition ({count}/{game.DUNGEON_MAX_PARTY}). "
-                          f"The horn sounds when the party is ready.")
+        # Re-render the shared lobby card in place so its roster and Party (N/5)
+        # count update live for everyone; the channel callout still fires.
+        updated = {**lobby, "member_count": count}
+        _lobby_response(ctx, updated, _lobby_members(ctx, dungeon_id), now,
+                        update_message=True)
         _broadcast(ctx, lobby["channel_id"],
                    content=f"🛡️ **{username or 'A hero'}** joined the expedition into "
                            f"{dungeon['name']} — {count}/{game.DUNGEON_MAX_PARTY}.")
@@ -1982,7 +1990,9 @@ def cmd_craft(ctx, event):
     _do_craft(ctx, event, state, recipe_id)
 
 
-def _craft_list(ctx, player):
+def _craft_list(ctx, player, *, update_message=False, flash=""):
+    """Render the crafting board. `flash` prepends a one-line notice (used after
+    a forge so the button path re-renders the list with fresh material states)."""
     owned = _materials_of(ctx, player["user_id"])
     lines = [_recipe_line(rid, recipe, owned) for rid, recipe in game.RECIPES.items()]
     buttons = []
@@ -1997,11 +2007,12 @@ def _craft_list(ctx, player):
     ctx.interaction.respond(
         embeds=[_embed(
             "⚒️ The Emberforge — Crafting",
-            "\n".join(lines) + "\n\nMaterials drop from dungeons, adventures, and rare hunts.",
+            flash + "\n".join(lines) + "\n\nMaterials drop from dungeons, adventures, and rare hunts.",
             footer=game.VIRTUAL_NOTE,
         )],
         components=[ActionRow(*buttons)],
         ephemeral=True,
+        update_message=update_message,
     )
 
 
@@ -2019,7 +2030,7 @@ def comp_craft(ctx, event):
     if recipe_id not in game.RECIPES:
         _try_respond(ctx, "The forge knows no such recipe — see **/craft** for the catalog.")
         return
-    _do_craft(ctx, event, state, recipe_id)
+    _do_craft(ctx, event, state, recipe_id, from_component=True)
 
 
 def _refund_craft_costs(ctx, name, user_id, taken_materials, fee, epoch):
@@ -2037,7 +2048,7 @@ def _refund_craft_costs(ctx, name, user_id, taken_materials, fee, epoch):
         pass
 
 
-def _do_craft(ctx, event, state, recipe_id):
+def _do_craft(ctx, event, state, recipe_id, *, from_component=False):
     player = state["player"]
     recipe = game.RECIPES[recipe_id]
     item = game.ITEMS[recipe_id]
@@ -2085,6 +2096,15 @@ def _do_craft(ctx, event, state, recipe_id):
     _quietly(_quest_event, ctx, user_id, "craft", _now())
     consumed = " · ".join(f"{game.ITEMS[m]['emoji']} {game.ITEMS[m]['name']} ×{n}"
                           for m, n in recipe["materials"].items())
+    if from_component:
+        # Re-render the recipe board in place with updated material/craftable
+        # states and a forge banner, so the buttons stay live and accurate.
+        fresh = _get_player(ctx, user_id) or player
+        _craft_list(
+            ctx, fresh, update_message=True,
+            flash=f"⚒️ Forged **{item['emoji']} {item['name']}** — consumed {consumed}, "
+                  f"**{recipe['fee']:,} {game.CURRENCY}** fee.{equipped_note}\n\n")
+        return
     ctx.interaction.respond(embeds=[_embed(
         f"⚒️ Forged: {item['emoji']} {item['name']}",
         f"Consumed {consumed} and a **{recipe['fee']:,} {game.CURRENCY}** forge fee."
@@ -2485,8 +2505,11 @@ def comp_duel_accept(ctx, event):
                    f"glory alone changes hands.")
     if winner_levels > 0:
         description += f"\n🎉 **{winner_name}** reaches level {winner['level'] + winner_levels}!"
+    # Rewrite the challenge card into the result and strip the now-dead
+    # Accept/Decline buttons (update_message needs SDK >=0.7).
     ctx.interaction.respond(embeds=[_embed("⚔️ The duel is settled!", description,
-                                           footer=game.VIRTUAL_NOTE)])
+                                           footer=game.VIRTUAL_NOTE)],
+                            update_message=True, components=[])
 
 
 @plugin.on_component(prefix=DUEL_DECLINE_PREFIX)
@@ -2518,8 +2541,10 @@ def comp_duel_decline(ctx, event):
         title = "🕊️ Challenge declined"
         description = (f"**{duel['target_name']}** walks away — "
                        f"{'the stake returns to ' + (duel['challenger_name'] or 'the challenger') if int(duel['bet']) else 'no harm done'}.")
+    # Close the challenge card in place and clear its Accept/Decline buttons.
     ctx.interaction.respond(embeds=[_embed(title, description,
-                                           footer=game.VIRTUAL_NOTE)])
+                                           footer=game.VIRTUAL_NOTE)],
+                            update_message=True, components=[])
 
 
 # --- /trade: player-to-player sales (Phase 3) ---------------------------------------------------
@@ -2759,13 +2784,14 @@ def comp_trade_accept(ctx, event):
         raise  # _safe answers the user
     ctx.metrics.record("trades_resolved")
     item = game.ITEMS[trade["item_id"]]
+    # Rewrite the offer card into the result and clear its dangling buttons.
     ctx.interaction.respond(embeds=[_embed(
         "🤝 Deal struck!",
         f"**{buyer_name}** takes **{item['emoji']} {item['name']} ×{trade['qty']}**"
         + (f" and **{trade['seller_name']}** pockets **{price:,} {game.CURRENCY}**."
            if price else f" — with **{trade['seller_name']}**'s compliments."),
         footer=game.VIRTUAL_NOTE,
-    )])
+    )], update_message=True, components=[])
 
 
 @plugin.on_component(prefix=TRADE_DECLINE_PREFIX)
@@ -2787,8 +2813,12 @@ def comp_trade_decline(ctx, event):
         _try_respond(ctx, "💱 That trade was already settled elsewhere.")
         return
     _refund_trade_escrow(ctx, trade)
-    _try_respond(ctx, "You wave the offer away — the goods return to the seller.",
-                 ephemeral=False)
+    # Close the offer card in place and clear its Accept/Decline/Cancel buttons.
+    ctx.interaction.respond(embeds=[_embed(
+        "🕊️ Offer declined",
+        "The offer is waved away — the goods return to the seller.",
+        footer=game.VIRTUAL_NOTE,
+    )], update_message=True, components=[])
 
 
 @plugin.on_component(prefix=TRADE_CANCEL_PREFIX)
@@ -2810,7 +2840,13 @@ def comp_trade_cancel(ctx, event):
         _try_respond(ctx, "💱 That trade was already settled elsewhere.")
         return
     _refund_trade_escrow(ctx, trade)
-    _try_respond(ctx, "Offer withdrawn — your goods are back in your satchel.")
+    # Withdraw the offer card in place so the buyer sees it close, not a stale
+    # set of live buttons.
+    ctx.interaction.respond(embeds=[_embed(
+        "🕊️ Offer withdrawn",
+        "The seller withdraws the offer — the goods are back in their satchel.",
+        footer=game.VIRTUAL_NOTE,
+    )], update_message=True, components=[])
 
 
 # --- /guild (Phase 3) ------------------------------------------------------------------------
@@ -3167,19 +3203,23 @@ def _do_arena_enter(ctx, event, state, today):
             _try_respond(ctx, "🏟️ The day turned at UTC midnight and that tournament "
                               "has closed — your fee is returned. Run **/arena** again.")
         return
-    # UTC-midnight TOCTOU: a payout claim may have landed in the instant our
-    # entry inserted. Re-check and unwind rather than swallowing the fee with
-    # a success message for a tournament that already settled.
-    if ctx.sql.query_one("SELECT 1 AS x FROM arena_days WHERE day = %s", [today]):
-        ctx.sql.execute(_DELETE_OWN_ARENA_ENTRY, [today, player["user_id"]])
-        ctx.sql.execute(_CREDIT_COINS_EPOCH,
-                        [username, game.ARENA_FEE, player["user_id"], _epoch(player)])
-        _try_respond(ctx, "🏟️ The day turned at UTC midnight and that tournament "
-                          "has closed — your fee is returned. Run **/arena** again.")
-        return
+    # The entry is in and counted: award its XP / metrics / quest credit.
     _settle_social(ctx, player, game.ARENA_XP)
     ctx.metrics.record("arena_entries")
     _quietly(_quest_event, ctx, player["user_id"], "arena", now)
+    # UTC-midnight TOCTOU: a payout claimed this day in the instant our entry
+    # landed. Because _ARENA_ENTER is guarded by "arena_days has no row for today",
+    # reaching here means our entry raced a concurrent settle. If that settle's
+    # entry-read saw our (already-committed) row, deleting + refunding the fee now
+    # would double-pay a podium finisher — or return a fee that funded the pool; if
+    # it didn't see us, our fee simply burns. We can't cheaply tell which, so we
+    # never refund: the entry stands in the settled tournament (burn-bias — worst
+    # case the fee burns, never a mint), and the player is told they made the day.
+    if ctx.sql.query_one("SELECT 1 AS x FROM arena_days WHERE day = %s", [today]):
+        _try_respond(ctx, "🏟️ The day turned at UTC midnight just as you stepped onto "
+                          "the sand — you're counted in today's final results. Run "
+                          "**/arena** for the next bracket.")
+        return
     _arena_standings(ctx, today, player, state["multiplier"], just_entered=score)
 
 
@@ -3278,7 +3318,36 @@ def _owned_pets(ctx, user_id):
     return [pid for pid in game.PET_PERKS if owned.get(pid, 0) > 0]
 
 
-def _set_active_pet(ctx, event, state, pet_id):
+def _pet_list_response(ctx, player, *, update_message=False, flash=""):
+    """Render the companions board. `flash` prepends a one-line notice (used
+    after a swap so the button path re-renders the list in place)."""
+    owned = _owned_pets(ctx, player["user_id"])
+    active = player.get("pet") or ""
+    lines = []
+    buttons = []
+    for pet_id in owned:
+        pet = game.ITEMS[pet_id]
+        marker = "▸ " if pet_id == active else ""
+        lines.append(f"{marker}{pet['emoji']} **{pet['name']}** — "
+                     f"{game.PET_PERKS[pet_id]['label']}")
+        if pet_id != active:
+            buttons.append(Button(pet["name"], f"{PET_SET_PREFIX}{pet_id}:{player['user_id']}",
+                                  style="secondary", emoji=pet["emoji"]))
+    description = ("\n".join(lines) if lines else
+                   "*No companions yet — they hatch from Ember Caches (**/open**), "
+                   "and the wilds say dungeon caches hold the rarest.*")
+    if active and active in game.PET_PERKS:
+        description = (f"Walking with you: {game.ITEMS[active]['emoji']} "
+                       f"**{game.ITEMS[active]['name']}**\n\n") + description
+    ctx.interaction.respond(
+        embeds=[_embed("🐾 Your Companions", flash + description)],
+        components=[ActionRow(*buttons[:5])] if buttons else None,
+        ephemeral=True,
+        update_message=update_message,
+    )
+
+
+def _set_active_pet(ctx, event, state, pet_id, *, from_component=False):
     player = state["player"]
     pet = game.ITEMS[pet_id]
     if player.get("pet") == pet_id:
@@ -3290,6 +3359,15 @@ def _set_active_pet(ctx, event, state, pet_id):
                            [pet_id, player["user_id"], player["user_id"], pet_id]):
         _try_respond(ctx, f"No {pet['name']} answers your whistle — companions hatch "
                           f"from Ember Caches (**/open**).")
+        return
+    if from_component:
+        # Re-render the companions list in place with the new active pet and
+        # refreshed buttons, keeping the swap flow on one card.
+        fresh = _get_player(ctx, player["user_id"]) or player
+        _pet_list_response(
+            ctx, fresh, update_message=True,
+            flash=f"{pet['emoji']} **{pet['name']}** takes the lead — "
+                  f"{game.PET_PERKS[pet_id]['label']}.\n\n")
         return
     ctx.interaction.respond(embeds=[_embed(
         f"{pet['emoji']} {pet['name']} takes the lead!",
@@ -3312,29 +3390,7 @@ def cmd_pet(ctx, event):
             return
         _set_active_pet(ctx, event, state, pet_id)
         return
-    owned = _owned_pets(ctx, player["user_id"])
-    active = player.get("pet") or ""
-    lines = []
-    buttons = []
-    for pet_id in owned:
-        pet = game.ITEMS[pet_id]
-        marker = "▸ " if pet_id == active else ""
-        lines.append(f"{marker}{pet['emoji']} **{pet['name']}** — "
-                     f"{game.PET_PERKS[pet_id]['label']}")
-        if pet_id != active:
-            buttons.append(Button(pet["name"], f"{PET_SET_PREFIX}{pet_id}:{player['user_id']}",
-                                  style="secondary", emoji=pet["emoji"]))
-    description = ("\n".join(lines) if lines else
-                   "*No companions yet — they hatch from Ember Caches (**/open**), "
-                   "and the wilds say dungeon caches hold the rarest.*")
-    if active and active in game.PET_PERKS:
-        description = (f"Walking with you: {game.ITEMS[active]['emoji']} "
-                       f"**{game.ITEMS[active]['name']}**\n\n") + description
-    ctx.interaction.respond(
-        embeds=[_embed("🐾 Your Companions", description)],
-        components=[ActionRow(*buttons[:5])] if buttons else None,
-        ephemeral=True,
-    )
+    _pet_list_response(ctx, player)
 
 
 @plugin.on_component(prefix=PET_SET_PREFIX)
@@ -3351,7 +3407,7 @@ def comp_pet_set(ctx, event):
     if pet_id not in game.PET_PERKS:
         _try_respond(ctx, "No such companion.")
         return
-    _set_active_pet(ctx, event, state, pet_id)
+    _set_active_pet(ctx, event, state, pet_id, from_component=True)
 
 
 # --- /open: Ember Caches (Phase 4) ----------------------------------------------------------------
@@ -3372,7 +3428,7 @@ def _odds_embed():
     )
 
 
-def _do_open(ctx, event, state, box_id):
+def _do_open(ctx, event, state, box_id, *, from_component=False):
     player = state["player"]
     now = _now()
     box = game.ITEMS[box_id]
@@ -3438,11 +3494,15 @@ def _do_open(ctx, event, state, box_id):
         Button("Odds", f"{LOOT_ODDS_PREFIX}{player['user_id']}",
                style="secondary", emoji="📊"),
     )]
+    # A reroll from the "Open another" button refreshes the same ephemeral card
+    # in place; a public reveal (jackpot / new companion) can't be delivered by
+    # editing an ephemeral message, so it posts a fresh public card as before.
     ctx.interaction.respond(
         embeds=[_embed(f"{box['emoji']} {box['name']} creaks open…", description,
                        footer=game.VIRTUAL_NOTE)],
         components=components,
         ephemeral=not public,
+        update_message=from_component and not public,
     )
 
 
@@ -3498,22 +3558,16 @@ def comp_loot_again(ctx, event):
     if box_id not in game.LOOT_TABLES:
         _try_respond(ctx, "That cache crumbled to ash.")
         return
-    _do_open(ctx, event, state, box_id)
+    _do_open(ctx, event, state, box_id, from_component=True)
 
 
 # --- /quests: the daily board (Phase 4) --------------------------------------------------------------
 
-@plugin.on_slash_command("quests")
-@_safe
-def cmd_quests(ctx, event):
-    state = _begin(ctx, event, "quests")
-    if state is None:
-        return
-    player = state["player"]
-    now = _now()
+def _quest_board_response(ctx, player, now, *, update_message=False, flash=""):
+    """Render today's quest board. `flash` prepends a one-line notice (used after
+    a claim so the button path re-renders the board in place — the claimed quest
+    strikes through and its button drops, while the others stay live)."""
     day = game.arena_day(now)
-    ctx.sql.execute(_PRUNE_QUESTS, [game.arena_day(now - game.QUEST_PRUNE_DAYS * 86400)])
-
     quests = game.daily_quests(player["user_id"], day)
     rows = ctx.sql.query(
         "SELECT quest_idx, progress, claimed FROM quest_progress "
@@ -3548,12 +3602,25 @@ def cmd_quests(ctx, event):
     ctx.interaction.respond(
         embeds=[_embed(
             f"📜 The Quest Board — {day}",
-            banner + "\n".join(lines) + "\n\nThe board redraws when the day turns (UTC).",
+            flash + banner + "\n".join(lines) + "\n\nThe board redraws when the day turns (UTC).",
             footer=game.VIRTUAL_NOTE,
         )],
         components=[ActionRow(*buttons[:5])] if buttons else None,
         ephemeral=True,
+        update_message=update_message,
     )
+
+
+@plugin.on_slash_command("quests")
+@_safe
+def cmd_quests(ctx, event):
+    state = _begin(ctx, event, "quests")
+    if state is None:
+        return
+    player = state["player"]
+    now = _now()
+    ctx.sql.execute(_PRUNE_QUESTS, [game.arena_day(now - game.QUEST_PRUNE_DAYS * 86400)])
+    _quest_board_response(ctx, player, now)
 
 
 @plugin.on_component(prefix=QUEST_CLAIM_PREFIX)
@@ -3589,11 +3656,14 @@ def comp_quest_claim(ctx, event):
                      _epoch(player)])
     _settle_social(ctx, player, game.QUEST_XP)
     ctx.metrics.record("quests_claimed")
-    ctx.interaction.respond(embeds=[_embed(
-        "🎁 Quest complete!",
-        f"*{quest['desc']}* — **+{reward:,} {game.CURRENCY}** and **+{game.QUEST_XP} XP**.",
-        footer=game.VIRTUAL_NOTE,
-    )], ephemeral=True)
+    # Re-render the board in place: the claimed quest strikes through and its
+    # button drops, the others stay live, and the payout rides a banner so the
+    # reward feedback isn't lost when the standalone card goes away.
+    fresh = _get_player(ctx, player["user_id"]) or player
+    _quest_board_response(
+        ctx, fresh, now, update_message=True,
+        flash=f"🎁 Claimed *{quest['desc']}* — **+{reward:,} {game.CURRENCY}** and "
+              f"**+{game.QUEST_XP} XP**.\n\n")
 
 
 # --- /rekindle: prestige (Phase 4) ---------------------------------------------------------------------

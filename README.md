@@ -80,11 +80,11 @@ your server's leaderboard — with a real admin dashboard for live stats and a t
 
 ## Development
 
-Built against **yourbot-sdk 0.6.1**. Everything runs locally — no Docker, no Discord connection.
+Built against **yourbot-sdk 0.8.2**. Everything runs locally — no Docker, no Discord connection.
 
 ```bash
 uv venv .venv
-uv pip install --python .venv/bin/python "yourbot-sdk>=0.6.1,<0.7" pytest
+uv pip install --python .venv/bin/python "yourbot-sdk>=0.8.2,<0.9" pytest
 
 # run the test suite
 .venv/bin/python -m pytest tests/ -q
@@ -155,7 +155,7 @@ root). Review turnaround is typically 1–3 business days.
 
 ## Versions
 
-See [CHANGELOG.md](CHANGELOG.md). Current: **0.4.4**.
+See [CHANGELOG.md](CHANGELOG.md). Current: **0.4.5**.
 
 ## License
 
