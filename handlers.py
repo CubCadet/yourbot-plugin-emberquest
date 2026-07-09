@@ -59,10 +59,10 @@ KV_SCHEMA_REV = "schema_rev"
 
 COMMAND_NAMES = [
     "start", "profile", "hunt", "adventure", "heal", "inventory",
-    "shop", "buy", "sell", "daily", "leaderboard", "coinflip",
+    "shop", "buy", "sell", "daily", "top", "coinflip",
     "dungeon", "craft", "enchant",
     "duel", "trade", "guild", "arena",
-    "equip", "pet", "open", "quests", "rekindle",
+    "equip", "pet", "open", "questlog", "rekindle",
 ]
 
 _rng = random.Random()
@@ -936,11 +936,11 @@ def cmd_start(ctx, event):
         "• **/dungeon** — rally 2–4 heroes against a miniboss (level 3+)\n"
         "• **/craft** gear and tonics from dungeon materials, **/enchant** your gear\n"
         "• **/duel** rivals, **/trade** with friends, **/guild** up, fight the daily **/arena**\n"
-        "• **/quests** each day, **/open** Ember Caches, raise a **/pet** — and one day, **/rekindle**\n"
+        "• **/questlog** each day, **/open** Ember Caches, raise a **/pet** — and one day, **/rekindle**\n"
         "• **/heal** with healing tonics when the wounds add up\n"
         "• **/shop**, **/buy** and **/sell** to gear up\n"
         "• **/profile**, **/inventory**, and **/equip** to manage your hero\n"
-        "• **/daily** for your stipend, **/leaderboard** to see the legends\n"
+        "• **/daily** for your stipend, **/top** to see the legends\n"
         "• **/coinflip** if you feel lucky\n\n"
         "HP regenerates slowly on its own. Good hunting!",
         footer=game.VIRTUAL_NOTE,
@@ -1425,12 +1425,12 @@ def cmd_daily(ctx, event):
     )])
 
 
-# --- /leaderboard ---------------------------------------------------------------------
+# --- /top -----------------------------------------------------------------------------
 
-@plugin.on_slash_command("leaderboard")
+@plugin.on_slash_command("top")
 @_safe
-def cmd_leaderboard(ctx, event):
-    state = _begin(ctx, event, "leaderboard", needs_player=False)
+def cmd_top(ctx, event):
+    state = _begin(ctx, event, "top", needs_player=False)
     if state is None:
         return
     metric = str(_options(event).get("metric") or "level").lower()
@@ -3561,7 +3561,7 @@ def comp_loot_again(ctx, event):
     _do_open(ctx, event, state, box_id, from_component=True)
 
 
-# --- /quests: the daily board (Phase 4) --------------------------------------------------------------
+# --- /questlog: the daily board (Phase 4) ------------------------------------------------------------
 
 def _quest_board_response(ctx, player, now, *, update_message=False, flash=""):
     """Render today's quest board. `flash` prepends a one-line notice (used after
@@ -3611,10 +3611,10 @@ def _quest_board_response(ctx, player, now, *, update_message=False, flash=""):
     )
 
 
-@plugin.on_slash_command("quests")
+@plugin.on_slash_command("questlog")
 @_safe
-def cmd_quests(ctx, event):
-    state = _begin(ctx, event, "quests")
+def cmd_questlog(ctx, event):
+    state = _begin(ctx, event, "questlog")
     if state is None:
         return
     player = state["player"]
@@ -3629,7 +3629,7 @@ def comp_quest_claim(ctx, event):
     rest = _owner_of(event, QUEST_CLAIM_PREFIX)
     idx_str, _, owner = rest.partition(":")
     if str(event.get("user_id")) != owner:
-        _try_respond(ctx, "📜 That board isn't yours — **/quests** shows your own.")
+        _try_respond(ctx, "📜 That board isn't yours — **/questlog** shows your own.")
         return
     state = _begin(ctx, event, "quest_claim")
     if state is None:
@@ -3641,14 +3641,14 @@ def comp_quest_claim(ctx, event):
     try:
         quest = quests[int(idx_str)]
     except (ValueError, IndexError):
-        _try_respond(ctx, "📜 That quest faded with yesterday's board — see **/quests**.")
+        _try_respond(ctx, "📜 That quest faded with yesterday's board — see **/questlog**.")
         return
     # Quest progress deliberately survives a Rekindling: a completed quest is
     # income already earned (the confirm screen says so); the claim below pays
     # at the CURRENT epoch and level, so nothing pre-burn is resurrected.
     if not ctx.sql.execute(_QUEST_CLAIM_CAS,
                            [player["user_id"], day, int(idx_str), quest["target"]]):
-        _try_respond(ctx, "📜 Not finished yet — or already claimed. **/quests** has the tally.")
+        _try_respond(ctx, "📜 Not finished yet — or already claimed. **/questlog** has the tally.")
         return
     reward = game.quest_reward(quest, player["level"], _boosts_for(player, now))
     ctx.sql.execute(_CREDIT_COINS_EPOCH,

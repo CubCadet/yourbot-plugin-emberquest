@@ -1,7 +1,7 @@
 {
   "id": "emberquest",
   "name": "EmberQuest",
-  "version": "0.4.5",
+  "version": "0.5.0",
   "description": "An original Discord RPG set in the Cinderwilds — hunt ash-born monsters, raid dungeon minibosses with your party, duel rivals, trade with friends, found guilds, fight in the daily arena, hatch companions from Ember Caches, clear daily quests, chase seasonal events, and Rekindle your legend for permanent bonuses. Embers are virtual currency with no real-world value. Includes an admin dashboard with live stats and a tunable economy.",
   "author": "EmberStream Studio",
   "tags": ["rpg", "economy", "game", "fun"],
@@ -27,7 +27,7 @@
         { "name": "item", "description": "Item name", "type": 3, "required": true }
       ] },
     { "name": "daily", "description": "Claim your daily Ember stipend (24h)" },
-    { "name": "leaderboard", "description": "Top heroes on this server",
+    { "name": "top", "description": "Top heroes on this server",
       "options": [
         { "name": "metric", "description": "Rank by: level (default), coins, or guild", "type": 3, "required": false }
       ] },
@@ -77,7 +77,7 @@
       "options": [
         { "name": "item", "description": "Which cache to open (default: first owned)", "type": 3, "required": false }
       ] },
-    { "name": "quests", "description": "Your three daily quests — progress, rewards, and claims" },
+    { "name": "questlog", "description": "Your three daily quests — progress, rewards, and claims" },
     { "name": "rekindle", "description": "Prestige: burn your progress (level 20+) for a permanent reward bonus" }
   ]
 }

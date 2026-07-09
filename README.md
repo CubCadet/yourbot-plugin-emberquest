@@ -56,7 +56,7 @@ your server's leaderboard — with a real admin dashboard for live stats and a t
 | `/shop` | Browse the Emberforge (paginated) |
 | `/buy item:` / `/sell item:` | Trade with the shop; gear auto-equips on upgrade |
 | `/daily` | Daily Ember stipend + a tonic (24h, survives restarts) |
-| `/leaderboard [metric]` | Top 10 by `level`, `coins`, or `guild` |
+| `/top [metric]` | Top 10 by `level`, `coins`, or `guild` |
 | `/coinflip bet:` | Fair 50/50 flip for Embers |
 | `/dungeon [target]` | Open or view a 2–4 hero expedition (2h cooldown, level 3+) |
 | `/craft [item]` | List recipes or forge one from materials |
@@ -68,7 +68,7 @@ your server's leaderboard — with a real admin dashboard for live stats and a t
 | `/equip item:` | Equip any owned sword/armor (enchant resets on swap) |
 | `/pet [name:]` | See your companions or choose who walks beside you |
 | `/open [item:]` | Crack an Ember Cache — odds shown before you buy |
-| `/quests` | Today's three quests: progress, rewards, claims |
+| `/questlog` | Today's three quests: progress, rewards, claims |
 | `/rekindle` | Prestige at level 20+ for a permanent reward bonus |
 
 ## Requirements
@@ -80,11 +80,11 @@ your server's leaderboard — with a real admin dashboard for live stats and a t
 
 ## Development
 
-Built against **yourbot-sdk 0.8.2**. Everything runs locally — no Docker, no Discord connection.
+Built against **yourbot-sdk 0.8.3**. Everything runs locally — no Docker, no Discord connection.
 
 ```bash
 uv venv .venv
-uv pip install --python .venv/bin/python "yourbot-sdk>=0.8.2,<0.9" pytest
+uv pip install --python .venv/bin/python "yourbot-sdk>=0.8.3,<0.9" pytest
 
 # run the test suite
 .venv/bin/python -m pytest tests/ -q
@@ -155,7 +155,7 @@ root). Review turnaround is typically 1–3 business days.
 
 ## Versions
 
-See [CHANGELOG.md](CHANGELOG.md). Current: **0.4.5**.
+See [CHANGELOG.md](CHANGELOG.md). Current: **0.5.0**.
 
 ## License
 

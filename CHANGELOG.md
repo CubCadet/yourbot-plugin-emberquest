@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0 — Command renames for SDK 0.8.3's reserved-name policy (2026-07-09)
+
+**yourbot-sdk 0.8.3** ships a new vendored validator rule mirroring a platform-side
+publish gate: 34 command names used by built-in YourBot plugins are now reserved,
+and marketplace plugins may not declare them. Two EmberQuest commands collided,
+so both are renamed (a user-facing change — hence the minor bump):
+
+- **`/leaderboard` → `/top`** — same command, same `metric:` option
+  (`level`/`coins`/`guild`).
+- **`/quests` → `/questlog`** — same daily board, buttons, and claims. Quest
+  progress, storage, and rewards are untouched; only the command name changed.
+
+SDK pin raised to `>=0.8.3,<0.9` (requirements.txt, CI, and the dev venv). The
+rest of the 0.8.3 delta is additive and beneficial: every RPC issued inside an
+event handler now carries a trusted event id so pooled workers can't
+cross-tenant drift (the "C5" fix), and dashboard error logs name the failing
+method correctly. Full suite green on 0.8.3; `yourbot validate` passes again
+(it fails on 0.8.3 for any plugin still declaring a reserved name).
+
+Tests expanded to 202 (from 200): the loot "Open another" reroll's *public*
+outcomes (jackpot, first companion hatch) now assert they post a fresh public
+card rather than editing the ephemeral card in place — a quadrant mutation
+testing showed the previous suite could not catch.
+
 ## 0.4.5 — SDK 0.8.2 & in-place UX (2026-07-07)
 
 Upgraded to **yourbot-sdk 0.8.2** (from 0.6.1 — the pin was two minor generations

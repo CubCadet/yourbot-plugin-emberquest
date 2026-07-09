@@ -686,7 +686,7 @@ def test_daily_scales_with_economy_multiplier(world):
     assert get_player(world)["coins"] == 350
 
 
-# --- /leaderboard ----------------------------------------------------------------------------
+# --- /top ------------------------------------------------------------------------------------
 
 def _seed_heroes(world):
     now = int(world.clock.now())
@@ -704,7 +704,7 @@ def _seed_heroes(world):
 
 def test_leaderboard_by_level_breaks_ties_on_xp(world):
     _seed_heroes(world)
-    handlers.cmd_leaderboard(world.ctx, slash("leaderboard"))
+    handlers.cmd_top(world.ctx, slash("top"))
     body = text_of(last(world.ctx))
     assert body.index("**Borin**") < body.index("**Cinder**") < body.index("**Aria**")
     assert "🥇" in body
@@ -712,7 +712,7 @@ def test_leaderboard_by_level_breaks_ties_on_xp(world):
 
 def test_leaderboard_by_coins_and_empty(world):
     _seed_heroes(world)
-    handlers.cmd_leaderboard(world.ctx, slash("leaderboard",
+    handlers.cmd_top(world.ctx, slash("top",
                                               options=[{"name": "metric", "value": "coins"}]))
     body = text_of(last(world.ctx))
     assert body.index("**Cinder**") < body.index("**Aria**") < body.index("**Borin**")
@@ -720,7 +720,7 @@ def test_leaderboard_by_coins_and_empty(world):
     empty = world.make_ctx()
     world.conn.execute("DELETE FROM players")
     world.conn.commit()
-    handlers.cmd_leaderboard(empty, slash("leaderboard"))
+    handlers.cmd_top(empty, slash("top"))
     assert "No heroes" in text_of(last(empty))
 
 
@@ -1808,7 +1808,7 @@ def test_guild_leaderboard_metric(world):
     set_player(world, "300", coins=3000)
     handlers.cmd_guild(world.ctx, slash("guild", uid="300", options=[
         {"name": "action", "value": "create"}, {"name": "name", "value": "Cinder Pact"}]))
-    handlers.cmd_leaderboard(world.ctx, slash("leaderboard",
+    handlers.cmd_top(world.ctx, slash("top",
                                               options=[{"name": "metric", "value": "guild"}]))
     body = text_of(last(world.ctx))
     assert body.index("**Ash Wardens**") < body.index("**Cinder Pact**")
@@ -2163,7 +2163,7 @@ def quest_keys_for(world, uid=UID):
 
 def test_quest_board_shows_three_and_progress_hooks_fire(world):
     started(world)
-    handlers.cmd_quests(world.ctx, slash("quests"))
+    handlers.cmd_questlog(world.ctx, slash("questlog"))
     body = text_of(last(world.ctx))
     assert body.count("▫️") + body.count("🎁") + body.count("✅") == game.QUESTS_PER_DAY
     assert "redraws when the day turns" in body
@@ -2189,7 +2189,7 @@ def test_quest_claim_pays_once_and_is_owner_scoped(world):
     quest = quests[target_idx]
     for _ in range(quest["target"]):
         handlers._quest_event(world.ctx, UID, quest["key"], int(world.clock.now()))
-    handlers.cmd_quests(world.ctx, slash("quests"))
+    handlers.cmd_questlog(world.ctx, slash("questlog"))
     buttons = last(world.ctx)["components"][0].to_dict()["components"]
     claim_id = f"{handlers.QUEST_CLAIM_PREFIX}{target_idx}:{UID}"
     assert any(b["custom_id"] == claim_id for b in buttons)
@@ -2214,7 +2214,7 @@ def test_quest_claim_rejects_incomplete_and_prunes_old(world):
         "INSERT INTO quest_progress (user_id, day, quest_idx, progress, claimed) "
         "VALUES (?, ?, 0, 5, 1)", [UID, old_day])
     world.conn.commit()
-    handlers.cmd_quests(world.ctx, slash("quests"))
+    handlers.cmd_questlog(world.ctx, slash("questlog"))
     assert world.conn.execute("SELECT COUNT(*) FROM quest_progress WHERE day = ?",
                               [old_day]).fetchone()[0] == 0
 
@@ -2308,7 +2308,7 @@ def test_seasonal_boost_and_creature_in_hunts(world):
     assert "Bloomwisp" in body and "creature of the season" in body
     expected = max(1, round(10 * 1.25 * game.SEASON_MOB_BONUS))
     assert get_player(world)["coins"] == expected
-    handlers.cmd_quests(world.ctx, slash("quests"))
+    handlers.cmd_questlog(world.ctx, slash("questlog"))
     assert "Ashbloom" in text_of(last(world.ctx))
     handlers.cmd_profile(world.ctx, slash("profile"))
     assert "burns" in text_of(last(world.ctx))
@@ -2471,7 +2471,7 @@ def test_manifest_capabilities_are_sufficient(world):
 
     # The recorder ctx.sql (no FakeSql override) exercises the storage:sql capability gate.
     recorder = MockContext(clock=world.clock, capabilities=caps)
-    handlers.cmd_leaderboard(recorder, slash("leaderboard"))
+    handlers.cmd_top(recorder, slash("top"))
     assert len(recorder.interaction.responses) == 1
 
     gated = MockContext(clock=world.clock, capabilities=["interaction:respond"])
@@ -2898,13 +2898,13 @@ def test_rate_limited_bootstrap_retries_and_heals(world, monkeypatch):
 
     # while the table is missing, the user sees the settling-in message
     started(world)
-    handlers.cmd_quests(world.ctx, slash("quests", guild_id="srv1"))
+    handlers.cmd_questlog(world.ctx, slash("questlog", guild_id="srv1"))
     assert "still settling in" in text_of(last(world.ctx))
 
     # the budget refills: the next command past the retry window heals it
     limited["on"] = False
     world.clock.advance(handlers._SCHEMA_RETRY_SECONDS + 1)
-    handlers.cmd_quests(world.ctx, slash("quests", guild_id="srv1"))
+    handlers.cmd_questlog(world.ctx, slash("questlog", guild_id="srv1"))
     assert "Quest Board" in text_of(last(world.ctx))
     assert world.ctx.kv.get(handlers.KV_SCHEMA_REV) == handlers._SCHEMA_REV
     assert "srv1" in handlers._schema_ok
@@ -2988,7 +2988,7 @@ def test_profile_of_started_other_hero_renders(world):
 
 def test_leaderboard_unknown_metric_falls_back_to_level(world):
     _seed_heroes(world)
-    handlers.cmd_leaderboard(world.ctx, slash("leaderboard",
+    handlers.cmd_top(world.ctx, slash("top",
                                               options=[{"name": "metric", "value": "banana"}]))
     body = text_of(last(world.ctx))
     assert "by level" in body                      # unrecognized metric coerced to level
@@ -3071,6 +3071,31 @@ def test_loot_reroll_edits_card_in_place_slash_stays_fresh(world):
     assert rerolled["update_message"] is True and rerolled["ephemeral"] is True
 
 
+def test_loot_reroll_public_jackpot_posts_fresh_card(world, monkeypatch):
+    # A public reveal can't be delivered by editing the ephemeral card the
+    # button lives on — a jackpot from "Open another" must post a fresh
+    # public message, never an in-place edit.
+    started(world)
+    give_items(world, UID, ember_cache=1)
+    monkeypatch.setattr(handlers, "_rng", SeqRng([0.995]))
+    handlers.comp_loot_again(world.ctx, press(f"{handlers.LOOT_AGAIN_PREFIX}ember_cache:{UID}"))
+    reveal = last(world.ctx)
+    assert "JACKPOT" in text_of(reveal)
+    assert reveal["ephemeral"] is False
+    assert reveal["update_message"] is False
+
+
+def test_loot_reroll_public_first_hatch_posts_fresh_card(world, monkeypatch):
+    started(world)
+    give_items(world, UID, ember_cache=1)
+    monkeypatch.setattr(handlers, "_rng", SeqRng([0.93]))
+    handlers.comp_loot_again(world.ctx, press(f"{handlers.LOOT_AGAIN_PREFIX}ember_cache:{UID}"))
+    reveal = last(world.ctx)
+    assert get_player(world)["pet"] == "ashwhisker"        # first hatch auto-adopts
+    assert reveal["ephemeral"] is False
+    assert reveal["update_message"] is False
+
+
 def test_craft_button_rerenders_recipe_list_in_place(world):
     started(world)
     give_items(world, UID, ember_shard=1)
@@ -3102,7 +3127,7 @@ def test_quest_claim_rerenders_board_in_place(world):
     quest = game.daily_quests(UID, day)[0]
     for _ in range(quest["target"]):
         handlers._quest_event(world.ctx, UID, quest["key"], int(world.clock.now()))
-    handlers.cmd_quests(world.ctx, slash("quests"))
+    handlers.cmd_questlog(world.ctx, slash("questlog"))
     claim_id = f"{handlers.QUEST_CLAIM_PREFIX}0:{UID}"
     handlers.comp_quest_claim(world.ctx, press(claim_id))
     board = last(world.ctx)
