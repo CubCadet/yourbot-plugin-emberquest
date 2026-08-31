@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from yourbot_sdk import CapabilityError
+from yourbot_sdk import CapabilityError, RateLimitError
 from yourbot_sdk.testing import MockClock, MockContext, make_event
 
 import game
@@ -2908,6 +2908,41 @@ def test_rate_limited_bootstrap_retries_and_heals(world, monkeypatch):
     assert "Quest Board" in text_of(last(world.ctx))
     assert world.ctx.kv.get(handlers.KV_SCHEMA_REV) == handlers._SCHEMA_REV
     assert "srv1" in handlers._schema_ok
+
+
+def test_budget_trip_stops_issuing_doomed_ddl(world, monkeypatch):
+    """A RateLimitError means the hourly DDL budget is spent, so every later
+    statement in the pass would be rejected too. The loop must stop at the
+    first trip: it also runs from a command's pre-respond preamble, where a
+    doomed RPC per remaining statement eats the 3s interaction window."""
+    world.ctx.kv.delete(handlers.KV_SCHEMA_REV)
+    handlers._schema_ok.clear()
+    for table in ("quest_progress", "locks", "dungeons"):
+        world.conn.execute("DROP TABLE " + table)
+    world.conn.commit()
+    real_execute = world.ctx.sql.execute
+    attempts = []
+    limited = {"on": True}
+
+    def budget_tripped(sql, params=None):
+        if sql.startswith(("CREATE", "ALTER")):
+            attempts.append(sql)
+            if limited["on"]:
+                raise RateLimitError("RPC error (sql.execute): DDL rate limit: "
+                                     "max 5 DDL statements per hour")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(world.ctx.sql, "execute", budget_tripped)
+    assert handlers._ensure_schema(world.ctx, "srv-budget") is False
+    assert len(attempts) == 1, "kept issuing DDL after the budget was exhausted"
+    assert world.ctx.kv.get(handlers.KV_SCHEMA_REV) is None  # NOT marked done
+    assert "srv-budget" not in handlers._schema_ok
+
+    # the budget refills: the next pass lands the three missing tables and marks
+    limited["on"] = False
+    assert handlers._ensure_schema(world.ctx, "srv-budget") is True
+    assert len(attempts) == 4  # the retried statement plus the two after it
+    assert world.ctx.kv.get(handlers.KV_SCHEMA_REV) == handlers._SCHEMA_REV
 
 
 def test_schema_orders_core_tables_into_first_ddl_window(world):

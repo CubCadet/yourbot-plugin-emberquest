@@ -268,10 +268,12 @@ def _ensure_schema(ctx, server_id=""):
     except (SdkError, RuntimeError, TypeError, ValueError):
         pass  # KV hiccup or junk value: fall through to the walled DDL
     failures = 0
+    unattempted = 0
     # strict zip: a probe/DDL length drift must fail loudly, never silently
     # truncate trailing statements (which could set the marker incompletely).
-    for probe, ddl in zip(_SCHEMA_PROBES + _MIGRATION_PROBES,
-                          _SCHEMA + _MIGRATIONS, strict=True):
+    plan = list(zip(_SCHEMA_PROBES + _MIGRATION_PROBES,
+                    _SCHEMA + _MIGRATIONS, strict=True))
+    for index, (probe, ddl) in enumerate(plan):
         try:
             ctx.sql.query_one(probe)
             continue  # already provisioned — don't spend DDL budget on a no-op
@@ -279,12 +281,24 @@ def _ensure_schema(ctx, server_id=""):
             pass  # missing relation/column (or a transient): issue the DDL
         try:
             ctx.sql.execute(ddl)
+        except RateLimitError as exc:
+            # The hourly DDL budget is spent, so every statement after this one
+            # would be rejected too. Stop the pass instead of burning a doomed
+            # RPC per remaining statement — this loop also runs from a command's
+            # pre-respond preamble (_maybe_retry_schema), where the round trips
+            # eat the 3s interaction window. The ~11-minute retry resumes once
+            # the budget refills.
+            unattempted = len(plan) - index
+            ctx.log("EmberQuest schema paused on the host's DDL budget: "
+                    + str(exc), level="warning")
+            break
         except (SdkError, RuntimeError) as exc:
             failures += 1
             ctx.log("EmberQuest schema statement skipped: " + str(exc),
                     level="warning")
-    if failures:
+    if failures or unattempted:
         ctx.log("EmberQuest schema incomplete: " + str(failures) + " statements "
+                "rejected and up to " + str(unattempted) + " not attempted, "
                 "deferred by the host's hourly DDL budget; retrying periodically. "
                 "Features touching missing tables will say the Cinderwilds are "
                 "still settling in.", level="warning")

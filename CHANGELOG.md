@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.1 — SDK 0.10.0 & a cheaper DDL-budget trip (2026-08-31)
+
+Upgraded to **yourbot-sdk 0.10.0** (from 0.8.3, four releases back). The whole
+0.8.4 → 0.10.0 delta is additive for everything EmberQuest uses — verified by
+diffing the installed packages, not by release notes — and the full suite plus
+`yourbot validate` (repo *and* extracted release zip) pass on it:
+
+- **0.8.4**: pool-mode server-side cron (manifest `"cron"` entries routed to
+  `@plugin.cron`); EmberQuest still runs no background jobs, so this is inert
+  here. Two more reserved command names (`help`, `yourbot`) — no collision.
+- **0.8.5**: unmapped host RPC errors now raise `RpcError`, which subclasses
+  both `SdkError` and `RuntimeError`, so the codebase-wide
+  `except (SdkError, RuntimeError)` walls keep catching everything. MockContext
+  signatures tightened to keyword-only to match production. Metric names are
+  now formally `[A-Za-z0-9_]`, max 64, no dots — all ten `metrics.record` names
+  already comply.
+- **0.9.0**: `ctx.sql.query` returns a list that also carries `.truncated`;
+  every multi-row query here already passes an explicit `limit=`, so nothing
+  can clip unnoticed. `ctx.kv.list` is now clamped to 100 keys per call (unused
+  — EmberQuest keeps three KV keys). **The validator now checks
+  `dashboard_manifest.json`**, which 0.8.3 did not look at at all; the
+  dashboard passes clean against the platform's own schema.
+- **0.10.0**: admin-supplied HTTP hosts (`ctx.http.allow_host`) — unused, this
+  plugin makes no outbound requests.
+
+**Bootstrap no longer burns doomed RPCs when the DDL budget trips.** The host
+caps schema changes at five DDL statements per hour, and that rejection arrives
+as a `RateLimitError`. The provisioning loop used to keep going, issuing a
+guaranteed-to-fail RPC for every remaining statement — inside a command's
+pre-respond preamble (`_maybe_retry_schema`), where those round trips eat the
+3s interaction window on a host that already flags responses over 2s. The pass
+now stops at the first budget trip and reports what was rejected versus never
+attempted; the existing ~11-minute retry still resumes after the refill.
+
+Tests 202 → 203: the new case asserts exactly one DDL statement is attempted
+after a trip and that the next pass heals — mutation-verified by turning the
+`break` back into a `continue`, which issues three and fails.
+
 ## 0.5.0 — Command renames for SDK 0.8.3's reserved-name policy (2026-07-09)
 
 **yourbot-sdk 0.8.3** ships a new vendored validator rule mirroring a platform-side
